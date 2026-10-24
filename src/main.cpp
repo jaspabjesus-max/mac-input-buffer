@@ -1,6 +1,5 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCScheduler.hpp>
-#include <Geode/modify/CCEGLView.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
@@ -8,33 +7,22 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstddef>
-#include <deque>
 #include <vector>
 
 using namespace geode::prelude;
 
 // ===========================================================================
-// Core: timestamps, buffers, and step-accurate draining
-// All of this runs on the main thread (GLFW polling, scheduler and physics
-// share it), so no locking is needed.
+// Core: timestamps, buffer, and step-accurate draining.
+// Everything runs on the main thread, so no locking is needed.
 // ===========================================================================
 namespace ib {
     using Clock     = std::chrono::high_resolution_clock;
     using TimePoint = Clock::time_point;
 
-    constexpr int    kButtonJump        = 1;
-    constexpr int    kGlfwRelease       = 0;
-    constexpr int    kGlfwPress         = 1;
-    constexpr int    kGlfwRepeat        = 2;
-    constexpr int    kGlfwMouseLeft     = 0;
-    constexpr int    kGlfwKeySpace      = 32;
-    constexpr int    kGlfwKeyW          = 87;
-    constexpr int    kGlfwKeyUp         = 265;
-    constexpr double kMaxEventAge       = 0.25;   // drop buffered inputs older than this (s)
-    constexpr double kMaxHardwareAge    = 0.10;   // ignore implausible OS event ages (s)
-    constexpr double kDefaultStep       = 1.0 / 240.0;
-    constexpr size_t kMaxHardwareQueue  = 16;
+    constexpr int    kButtonJump     = 1;
+    constexpr double kMaxEventAge    = 0.25;   // drop buffered inputs older than this (s)
+    constexpr double kMaxHardwareAge = 0.10;   // ignore implausible OS event ages (s)
+    constexpr double kDefaultStep    = 1.0 / 240.0;
 
     inline Clock::duration toDuration(double seconds) {
         return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
@@ -43,12 +31,6 @@ namespace ib {
     inline double toSeconds(Clock::duration d) {
         return std::chrono::duration<double>(d).count();
     }
-
-    // A raw hardware event captured in a GLFW callback.
-    struct HwEvent {
-        bool      down;
-        TimePoint when;
-    };
 
     // A jump input waiting to be applied at its matching physics step.
     struct Buffered {
@@ -59,13 +41,12 @@ namespace ib {
     };
 
     struct State {
-        bool                  enabled   = true;
-        bool                  injecting = false;
-        bool                  haveLast  = false;
+        bool                  enabled    = true;
+        bool                  injecting  = false;
+        bool                  haveLast   = false;
         TimePoint             lastUpdate{};
-        TimePoint             frameStart{};   // real-time start of the frame being simulated
-        double                simElapsed = 0; // simulated seconds consumed so far this frame
-        std::deque<HwEvent>   hw;
+        TimePoint             frameStart{};    // real-time start of the frame being simulated
+        double                simElapsed = 0;  // simulated seconds consumed so far this frame
         std::vector<Buffered> pending;
     };
 
@@ -75,56 +56,36 @@ namespace ib {
     }
 
     inline void reset() {
-        auto& s = state();
-        s.hw.clear();
-        s.pending.clear();
+        state().pending.clear();
     }
 
     inline bool isPlayLayer(GJBaseGameLayer* layer) {
         return layer && typeinfo_cast<PlayLayer*>(layer) != nullptr;
     }
 
-    // Seconds between the real hardware event and "now". Because GLFW delivers
-    // events at poll time, the OS-level event age is what recovers the true
-    // click time. HID state = physical devices only.
-    inline double hardwareAge(bool down, bool mouse) {
-        const CGEventType type = mouse
-            ? (down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp)
-            : (down ? kCGEventKeyDown       : kCGEventKeyUp);
+    // Seconds since the most recent physical event of this kind (mouse or
+    // keyboard, press or release). HID state = physical devices only.
+    inline double ageOf(CGEventType type) {
         const double age = CGEventSourceSecondsSinceLastEventType(
             kCGEventSourceStateHIDSystemState, type
         );
-        if (age < 0.0 || age > kMaxHardwareAge) return 0.0;
+        if (age < 0.0 || age > kMaxHardwareAge) return -1.0;
         return age;
     }
 
-    // Called from the GLFW callbacks.
-    inline void recordHardware(bool down, bool mouse) {
-        auto& s = state();
-        if (!s.enabled || !PlayLayer::get()) return;
+    // Real time of the physical input that produced this button event.
+    // Takes whichever of mouse/keyboard happened most recently. Falls back to
+    // "now" (vanilla timing) if the OS reports nothing plausible.
+    inline TimePoint inputTime(bool down) {
+        const double mouse = ageOf(down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp);
+        const double key   = ageOf(down ? kCGEventKeyDown       : kCGEventKeyUp);
 
-        const TimePoint when = Clock::now() - toDuration(hardwareAge(down, mouse));
-        if (s.hw.size() >= kMaxHardwareQueue) s.hw.pop_front();
-        s.hw.push_back({down, when});
-    }
+        double age = 0.0;
+        if (mouse >= 0.0 && key >= 0.0) age = std::min(mouse, key);
+        else if (mouse >= 0.0)          age = mouse;
+        else if (key >= 0.0)            age = key;
 
-    // Called from handleButton: find the oldest hardware event with a matching
-    // direction. Falls back to "now" (vanilla timing) if none is available.
-    inline TimePoint takeHardwareTime(bool down) {
-        auto& s = state();
-        const TimePoint now = Clock::now();
-
-        while (!s.hw.empty() && toSeconds(now - s.hw.front().when) > kMaxEventAge) {
-            s.hw.pop_front();
-        }
-        for (auto it = s.hw.begin(); it != s.hw.end(); ++it) {
-            if (it->down == down) {
-                const TimePoint t = it->when;
-                s.hw.erase(it);
-                return t;
-            }
-        }
-        return now;
+        return Clock::now() - toDuration(age);
     }
 
     // Advance one physics step and hand every buffered input whose real
@@ -177,27 +138,6 @@ class $modify(IBScheduler, CCScheduler) {
 };
 
 // ===========================================================================
-// GLFW window events: stamp left-click and jump-key events with true time
-// ===========================================================================
-class $modify(IBEGLView, CCEGLView) {
-    void onGLFWMouseCallBack(GLFWwindow* window, int button, int action, int mods) {
-        if (button == ib::kGlfwMouseLeft &&
-            (action == ib::kGlfwPress || action == ib::kGlfwRelease)) {
-            ib::recordHardware(action == ib::kGlfwPress, true);
-        }
-        CCEGLView::onGLFWMouseCallBack(window, button, action, mods);
-    }
-
-    void onGLFWKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-        const bool jumpKey = key == ib::kGlfwKeySpace || key == ib::kGlfwKeyUp || key == ib::kGlfwKeyW;
-        if (jumpKey && action != ib::kGlfwRepeat) {
-            ib::recordHardware(action == ib::kGlfwPress, false);
-        }
-        CCEGLView::onGLFWKeyCallback(window, key, scancode, action, mods);
-    }
-};
-
-// ===========================================================================
 // Input + physics: buffer jump presses, inject them at the matching step
 // ===========================================================================
 class $modify(IBGameLayer, GJBaseGameLayer) {
@@ -210,12 +150,12 @@ class $modify(IBGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        s.pending.push_back({down, button, isPlayer1, ib::takeHardwareTime(down)});
+        s.pending.push_back({down, button, isPlayer1, ib::inputTime(down)});
     }
 
     // Runs once per physics step. After the game has fed its own queue
     // through handleButton (which buffers it), release every input that is
-    // due at this step, before the player update that follows.
+    // due at this step.
     void processQueuedButtons(float dt, bool clearInputQueue) {
         GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
 

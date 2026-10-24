@@ -1,0 +1,19 @@
+{
+    "geode": "4.0.0",
+    "gd": {
+        "mac": "*"
+    },
+    "version": "v1.0.0",
+    "id": "developer.mac_input_buffer",
+    "name": "MacARM Input Buffer",
+    "developer": "Developer",
+    "description": "Sub-frame input buffering framework for macOS Apple Silicon.",
+    "settings": {
+        "enabled": {
+            "type": "bool",
+            "name": "Enabled",
+            "description": "Apply jump inputs at the physics step matching their real hardware time.",
+            "default": true
+        }
+    }
+}

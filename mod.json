@@ -3,17 +3,26 @@
     "gd": {
         "mac": "*"
     },
-    "version": "v1.0.0",
+    "version": "v1.1.0",
     "id": "developer.mac_input_buffer",
     "name": "MacARM Input Buffer",
     "developer": "Developer",
-    "description": "Sub-frame input buffering framework for macOS Apple Silicon.",
+    "description": "Widens tight jump timing windows by retrying clicks for a few physics frames.",
     "settings": {
-        "enabled": {
+        "assist-enabled": {
             "type": "bool",
             "name": "Enabled",
-            "description": "Apply jump inputs at the physics step matching their real hardware time.",
+            "description": "Retry jump clicks for a few physics frames.",
             "default": true
+        },
+        "window-frames": {
+            "type": "int",
+            "name": "Window (physics frames)",
+            "description": "How many physics steps a click stays active. 1 = vanilla.",
+            "default": 3,
+            "min": 1,
+            "max": 20,
+            "control": { "slider": true, "input": true }
         }
     }
 }

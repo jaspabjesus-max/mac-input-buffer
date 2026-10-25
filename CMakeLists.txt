@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_OSX_ARCHITECTURES "arm64")
 
-project(MacInputBuffer VERSION 1.0.0)
+project(MacInputBuffer VERSION 1.5.0)
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
@@ -18,7 +18,7 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
-# CGEventSourceSecondsSinceLastEventType lives in CoreGraphics
+# CGEventSource* (wave input guard) lives in CoreGraphics
 target_link_libraries(${PROJECT_NAME} "-framework CoreGraphics")
 
 setup_geode_mod(${PROJECT_NAME})

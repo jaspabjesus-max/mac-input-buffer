@@ -6,6 +6,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include <chrono>
+#include <cstring>
 #include <vector>
 
 using namespace geode::prelude;
@@ -49,11 +50,16 @@ namespace jw {
     inline int  g_stuckFrames[2] = {0, 0};
     inline int  g_guardLogs      = 0;
 
-    // True if the mouse button or a default jump key is physically down.
+    // True if ANY mouse button or keyboard key is physically down. Checking
+    // everything (not just default jump keys) means a rebound key can never
+    // look "released" while you are still holding it.
     inline bool physicalJumpHeld() {
         const auto src = kCGEventSourceStateHIDSystemState;
-        if (CGEventSourceButtonState(src, kCGMouseButtonLeft)) return true;
-        for (CGKeyCode k : {(CGKeyCode)0x31, (CGKeyCode)0x7E, (CGKeyCode)0x0D}) { // Space, Up, W
+        const CGMouseButton buttons[] = {kCGMouseButtonLeft, kCGMouseButtonRight, kCGMouseButtonCenter};
+        for (auto b : buttons) {
+            if (CGEventSourceButtonState(src, b)) return true;
+        }
+        for (CGKeyCode k = 0; k < 128; ++k) {
             if (CGEventSourceKeyState(src, k)) return true;
         }
         return false;
@@ -106,14 +112,42 @@ namespace jw {
         return (wasGround && !p->m_isOnGround) || up > kJumpVel;
     }
 
+    inline int ringCount(PlayerObject* p) {
+        return (p && p->m_touchingRings) ? static_cast<int>(p->m_touchingRings->count()) : 0;
+    }
+
+    inline void logReplaced(const Side& w) {
+        static int n = 0;
+        if (w.active && n < 100) {
+            ++n;
+            log::info("JW: previous buffer replaced by a new click (pressed={}, framesLeft={})",
+                w.pressed, w.framesLeft);
+        }
+    }
+
     // Diagnostic: which path did a real click take, and why?
-    inline int g_decisionLogs = 0;
+    // Counters + a summary every 25 clicks, so the log never runs out of budget.
+    inline int g_cntTotal = 0, g_cntReady = 0, g_cntSwallowed = 0, g_cntUnsupported = 0, g_cntInactive = 0;
     inline void logDecision(const char* why, PlayerObject* p) {
-        if (g_decisionLogs >= 80) return;
-        ++g_decisionLogs;
-        log::info("JW: click -> {} | window={} ground={} orb={} ship={} ufo={} ball={} wave={} robot={} spider={} swing={}",
+        const bool swallowed = std::strncmp(why, "SWALLOWED", 9) == 0;
+        if (swallowed)                          ++g_cntSwallowed;
+        else if (std::strstr(why, "on ground")) ++g_cntReady;
+        else if (std::strstr(why, "not supported")) ++g_cntUnsupported;
+        else                                    ++g_cntInactive;
+        ++g_cntTotal;
+        if (g_cntTotal % 25 == 0) {
+            log::info("JW: summary after {} clicks: passed-through(ground/orb)={} swallowed={} unsupported-mode={} inactive={}",
+                g_cntTotal, g_cntReady, g_cntSwallowed, g_cntUnsupported, g_cntInactive);
+        }
+
+        // Always log swallowed clicks (up to 300); log only the first 40 others.
+        static int detail = 0;
+        if (swallowed) { if (g_cntSwallowed > 300) return; }
+        else           { if (detail >= 40) return; ++detail; }
+
+        log::info("JW: click -> {} | window={} ground={} rings={} ship={} ufo={} ball={} wave={} robot={} spider={} swing={}",
             why, g_window,
-            p ? p->m_isOnGround : false, touchingOrb(p),
+            p ? p->m_isOnGround : false, ringCount(p),
             p ? p->m_isShip : false, p ? p->m_isBird : false, p ? p->m_isBall : false,
             p ? p->m_isDart : false, p ? p->m_isRobot : false, p ? p->m_isSpider : false,
             p ? p->m_isSwing : false);
@@ -176,9 +210,9 @@ namespace jw {
                     st.injecting = false;
                     g_waveDown[i] = false;
                     g_stuckFrames[i] = 0;
-                    if (g_guardLogs < 20) {
+                    if (g_guardLogs < 60) {
                         ++g_guardLogs;
-                        log::info("JW: released stuck wave hold (side {})", i);
+                        log::info("JW: released stuck wave hold (side {}) - no key or mouse button was down", i);
                     }
                 }
             }
@@ -210,7 +244,7 @@ namespace jw {
             if (w.pressed) {
                 if (jumpFired(p, w.wasGround)) {
                     static int firedLogs = 0;
-                    if (firedLogs < 60) {
+                    if (firedLogs < 300) {
                         ++firedLogs;
                         log::info("JW: jump fired (clicked in air: {}, frames used: {}/{})",
                             w.clickedInAir, g_window - w.framesLeft, g_window);
@@ -219,6 +253,12 @@ namespace jw {
                     w = Side{};
                     continue;
                 }
+                static int missLogs = 0;
+                if (missLogs < 150) {
+                    ++missLogs;
+                    log::info("JW: press did not register as a jump (vel={:.2f} ground={} wasGround={} rings={} framesLeft={})",
+                        static_cast<double>(p->m_yVelocity), p->m_isOnGround, w.wasGround, ringCount(p), w.framesLeft);
+                }
                 send(false);       // not legal after all: release so the next press is fresh
                 w.pressed = false;
             }
@@ -226,7 +266,7 @@ namespace jw {
             // 2. Window used up: stop and apply any held-back release.
             if (w.framesLeft <= 0) {
                 static int expiredLogs = 0;
-                if (expiredLogs < 60) {
+                if (expiredLogs < 300) {
                     ++expiredLogs;
                     log::info("JW: buffer expired, no jump (clicked in air: {})", w.clickedInAir);
                 }
@@ -247,7 +287,7 @@ namespace jw {
             // 3. Only press when a jump can actually happen.
             if (p->m_isOnGround || touchingOrb(p)) {
                 static int pressLogs = 0;
-                if (pressLogs < 60) {
+                if (pressLogs < 300) {
                     ++pressLogs;
                     log::info("JW: tick pressed (ground={} orb={} framesLeft={})",
                         p->m_isOnGround, touchingOrb(p), w.framesLeft);
@@ -264,7 +304,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 5 loaded (decision logging)");
+    log::info("JW: build 6 loaded (click summary counters, wider logs, any-key wave guard)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_window       = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-frames"));
@@ -352,6 +392,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             // timing, no swallow and no added latency.
             if (p->m_isOnGround || jw::touchingOrb(p)) {
                 jw::logDecision("PASS: on ground or touching orb", p);
+                jw::logReplaced(w);
                 w = jw::Side{};
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
                 return;
@@ -359,6 +400,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             // Airborne with nothing to click yet: swallow the click; the
             // tick presses once a jump becomes legal.
             jw::logDecision("SWALLOWED: airborne, holding click for the window", p);
+            jw::logReplaced(w);
             w = jw::Side{};
             w.active     = true;
             w.framesLeft = jw::g_window;

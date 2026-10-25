@@ -174,7 +174,7 @@ namespace jw {
             if (w.pressed) {
                 if (jumpFired(p, w.wasGround)) {
                     static int firedLogs = 0;
-                    if (firedLogs < 30) {
+                    if (firedLogs < 60) {
                         ++firedLogs;
                         log::info("JW: jump fired (clicked in air: {}, frames used: {}/{})",
                             w.clickedInAir, g_window - w.framesLeft, g_window);
@@ -190,11 +190,20 @@ namespace jw {
             // 2. Window used up: stop and apply any held-back release.
             if (w.framesLeft <= 0) {
                 static int expiredLogs = 0;
-                if (expiredLogs < 30) {
+                if (expiredLogs < 60) {
                     ++expiredLogs;
                     log::info("JW: buffer expired, no jump (clicked in air: {})", w.clickedInAir);
                 }
-                if (w.releaseDeferred) send(false);
+                if (!w.releaseDeferred) {
+                    // Still physically holding: give the game the held press
+                    // back, exactly as vanilla would have had it.
+                    send(true);
+                    static int restoreLogs = 0;
+                    if (restoreLogs < 20) {
+                        ++restoreLogs;
+                        log::info("JW: buffer expired while held, restored hold");
+                    }
+                }
                 w = Side{};
                 continue;
             }
@@ -213,6 +222,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
+    log::info("JW: build 3 loaded (ground clicks pass through, hold restored on expiry)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_window       = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-frames"));
@@ -277,7 +287,15 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
                 return;
             }
-            // Swallow the click; the tick presses once a jump is legal.
+            // Jump is already legal (on ground or touching an orb): vanilla
+            // timing, no swallow and no added latency.
+            if (p->m_isOnGround || jw::touchingOrb(p)) {
+                w = jw::Side{};
+                GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                return;
+            }
+            // Airborne with nothing to click yet: swallow the click; the
+            // tick presses once a jump becomes legal.
             w = jw::Side{};
             w.active     = true;
             w.framesLeft = jw::g_window;

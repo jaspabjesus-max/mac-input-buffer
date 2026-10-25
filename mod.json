@@ -3,7 +3,7 @@
     "gd": {
         "mac": "*"
     },
-    "version": "v1.5.0",
+    "version": "v1.5.1",
     "id": "developer.mac_input_buffer",
     "name": "MacARM Input Buffer",
     "developer": "Developer",
@@ -23,20 +23,20 @@
         },
         "window-frames": {
             "type": "int",
-            "name": "Window (display frames)",
-            "description": "How many rendered frames a click stays active. 1 = vanilla.",
-            "default": 2,
+            "name": "Cube window (display frames)",
+            "description": "How many rendered frames an early cube/ball/robot/spider click stays active. 1 = vanilla.",
+            "default": 5,
             "min": 1,
-            "max": 20,
+            "max": 60,
             "control": { "slider": true, "input": true }
         },
         "wave-delay": {
             "type": "int",
             "name": "Wave input delay (display frames)",
-            "description": "Delays wave presses and releases equally. 0 = off.",
+            "description": "Delays wave presses and releases equally. This is pure input lag, not an early-click window. 0 = off.",
             "default": 0,
             "min": 0,
-            "max": 6,
+            "max": 20,
             "control": { "slider": true, "input": true }
         },
         "wave-guard": {

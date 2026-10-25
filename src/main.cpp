@@ -52,6 +52,7 @@ namespace jw {
         bool     active         = false; // a press we are streaming/cushioning is in flight
         bool     releaseQueued  = false; // player let go; the release sits in the tick queue
         bool     releaseOk      = false; // gate: the queued release may now be delivered
+        bool     deferred       = false; // click was HELD BACK: the engine has not seen this press yet
         bool     registered     = false; // the engine acted on the press
         bool     pressGround    = false; // diagnostics
         int      pressRings     = 0;     // diagnostics
@@ -60,7 +61,8 @@ namespace jw {
         bool     prevUpsideDown = false;
         int      prevRings      = 0;
         double   prevUp         = 0.0;
-        uint64_t pressSeq       = 0;     // step counter when the press went in
+        uint64_t pressSeq       = 0;     // step counter when the player clicked
+        uint64_t sentSeq        = 0;     // step counter when the press actually reached the engine
         int      heldSteps      = 0;     // physics steps the press has been live
         int      ackSteps       = 0;     // ticks between the press and the engine acting on it
         int      maxSteps       = 0;     // step budget (stutter-proof, game time)
@@ -99,7 +101,7 @@ namespace jw {
     inline bool g_waveDown[2]  = {false, false};
     inline int  g_guardLogs    = 0;
     inline double g_stepsPerFrame = 4.0; // measured, read-only use (wave delay conversion)
-    inline double g_tps = kNominalTps;   // measured ticks per second (hook calls per wall second)
+    inline double g_tps = kNominalTps;   // fixed at the nominal rate (a measured value was too noisy to trust)
     inline int    g_waveEvents = 0, g_waveSpaced = 0; // wave inputs seen / saved from a same-tick collision
 
     inline double g_modUs = 0.0; // microseconds this mod spent since the last frame (diagnostic)
@@ -313,11 +315,31 @@ namespace jw {
     inline void flushSide(GJBaseGameLayer* layer, bool p1) { drain(layer, true, sideIdx(p1)); }
     inline void flushAll(GJBaseGameLayer* layer)           { drain(layer, true); }
 
+    // Forget every queued input of one side (used for clicks the engine never saw).
+    inline void dropSide(bool p1) {
+        const int i = sideIdx(p1);
+        g_queue.erase(std::remove_if(g_queue.begin(), g_queue.end(),
+                          [i](const Event& e) { return sideIdx(e.p1) == i; }),
+                      g_queue.end());
+        refreshLastDue();
+    }
+
+    // A held-back press whose key is still physically down must not be lost
+    // when we stop managing it: hand it to the engine now.
+    inline void sendHeldBack(GJBaseGameLayer* layer) {
+        auto& st = state();
+        for (int i = 0; i < 2; ++i) {
+            auto& w = st.sides[i];
+            if (w.active && w.deferred && !w.releaseQueued) inject(layer, true, i == 0);
+        }
+    }
+
     inline void beginCushion(Side& w, PlayerObject* p) {
         w = Side{};
         w.active         = true;
         w.clickTime      = Clock::now();   // diagnostics only
         w.pressSeq       = g_stepSeq;
+        w.sentSeq        = g_stepSeq;      // overwritten later if the click is held back
         w.maxSteps       = std::max(kMinHoldSteps,
                                static_cast<int>(std::lround(static_cast<double>(g_windowMs) * g_tps / 1000.0)));
         w.pressGround    = p->m_isOnGround;
@@ -383,14 +405,62 @@ namespace jw {
             const bool p1 = (i == 0);
             PlayerObject* p = p1 ? layer->m_player1 : layer->m_player2;
 
-            // Player gone or no longer in a supported mode: stop; a queued
-            // release is no longer gated and goes out this step.
+            // Player gone or no longer in a supported mode: stop managing it.
+            // A held-back press whose key is still down goes to the engine now;
+            // a held-back tap that was already released is simply forgotten.
             if (!p || !isCubeLike(p)) {
+                if (w.deferred) {
+                    if (w.releaseQueued) dropSide(p1);
+                    else if (p)          inject(layer, true, p1);
+                }
                 w = Side{};
                 continue;
             }
 
-            w.heldSteps = static_cast<int>(g_stepSeq - w.pressSeq);
+            const int age = static_cast<int>(g_stepSeq - w.pressSeq);   // ticks since the player clicked
+            w.heldSteps = age;
+
+            auto snapshot = [&]() {
+                w.prevGround     = p->m_isOnGround;
+                w.prevUpsideDown = p->m_isUpsideDown;
+                w.prevRings      = ringCount(p);
+                w.prevUp         = upVel(p);
+            };
+
+            // ---- Held-back click: the engine has NOT seen it. Deliver it on the
+            // first tick where it is legal (landed, or touching an orb).
+            if (w.deferred) {
+                if (p->m_isOnGround || ringCount(p) > 0) {
+                    snapshot();                       // judge the press against the state right before it
+                    w.deferred = false;
+                    w.sentSeq  = g_stepSeq;
+                    static int sendLogs = 0;
+                    if (sendLogs < 300) {
+                        ++sendLogs;
+                        log::info("JW: held-back click delivered to the engine {} ticks after the click ({})",
+                            age, p->m_isOnGround ? "landed" : "orb contact");
+                    }
+                    inject(layer, true, p1);
+                } else if (age >= w.maxSteps) {
+                    // Too early: no legal moment inside the window.
+                    recordOutcome(w);
+                    static int expLogs = 0;
+                    if (expLogs < 300) {
+                        ++expLogs;
+                        log::info("JW: held-back click expired after {} ticks with no legal moment ({})",
+                            age, w.releaseQueued ? "already released: dropped" : "key still down: forwarded to the engine");
+                    }
+                    if (w.releaseQueued) dropSide(p1);
+                    else                 inject(layer, true, p1);
+                    w = Side{};
+                    continue;
+                } else {
+                    snapshot();                       // keep waiting, engine sees nothing
+                    continue;
+                }
+            }
+
+            const int live = static_cast<int>(g_stepSeq - w.sentSeq);   // ticks since the engine got the press
 
             // Did the press take, judged against the snapshot? Landing is
             // excluded (ground contact zeroes velocity, which is not a jump).
@@ -414,7 +484,7 @@ namespace jw {
                         static int savedLogs = 0;
                         if (savedLogs < 300) {
                             ++savedLogs;
-                            log::info("JW: SAVED early click #{}: jump fired {} ticks ({:.1f} ms at {:.0f} TPS) after the press",
+                            log::info("JW: SAVED early click #{}: jump fired {} ticks ({:.1f} ms at {:.0f} TPS) after the click",
                                 g_savedClicks, w.ackSteps, w.ackSteps * 1000.0 / g_tps, g_tps);
                         }
                     }
@@ -423,13 +493,12 @@ namespace jw {
 
             detect();   // catches a press that took inside handleButton / the previous streamed press
 
-            const bool overBudget = w.heldSteps >= w.maxSteps;
+            const bool overBudget = age >= w.maxSteps && live >= kMinHoldSteps;
             const bool nearOrb    = ringCount(p) > 0;
-            const bool extend     = !w.registered && overBudget && nearOrb && w.heldSteps < kHardCapSteps;
+            const bool extend     = !w.registered && overBudget && nearOrb && age < kHardCapSteps;
 
-            // Continuous streaming: one more press on every sub-tick cycle
-            // until acknowledged. The first press already went in with the click.
-            if (!w.registered && w.heldSteps >= 1 && (!overBudget || extend)) {
+            // Continuous streaming: one more press on every tick until acknowledged.
+            if (!w.registered && live >= 1 && (!overBudget || extend)) {
                 inject(layer, true, p1);
                 ++w.streamed;
                 if (overBudget) ++w.extSteps;
@@ -437,12 +506,9 @@ namespace jw {
             }
 
             // Only now roll the snapshot forward, for the next step's comparison.
-            w.prevGround     = p->m_isOnGround;
-            w.prevUpsideDown = p->m_isUpsideDown;
-            w.prevRings      = ringCount(p);
-            w.prevUp         = upVel(p);
+            snapshot();
 
-            w.releaseOk = (w.registered && w.heldSteps >= kMinHoldSteps)
+            w.releaseOk = (w.registered && live >= kMinHoldSteps)
                        || (overBudget && !extend);
 
             // Player is still holding and we are done: nothing to release, stop tracking.
@@ -451,8 +517,8 @@ namespace jw {
                 static int doneLogs = 0;
                 if (doneLogs < 400) {
                     ++doneLogs;
-                    log::info("JW: press tracking ended while held (registered: {}, held {}/{} steps, streamed {}, extended {})",
-                        w.registered, w.heldSteps, w.maxSteps, w.streamed, w.extSteps);
+                    log::info("JW: press tracking ended while held (registered: {}, age {}/{} ticks, streamed {}, extended {})",
+                        w.registered, age, w.maxSteps, w.streamed, w.extSteps);
                 }
                 w = Side{};
             }
@@ -478,32 +544,6 @@ namespace jw {
             g_stepsPerFrame = std::clamp(g_stepsPerFrame * 0.9 + static_cast<double>(steps) * 0.1, 1.0, 16.0);
         }
 
-        // Measure the real tick rate over ~1 s windows. Steps inside a frame run
-        // back to back, so only an average over many frames is meaningful.
-        {
-            static double accWall = 0.0, accSteps = 0.0, idleMs = 0.0;
-            static bool firstLogged = false;
-            if (steps > 0 && steps <= 64) {
-                accWall  += frameMs + idleMs;
-                accSteps += static_cast<double>(steps);
-                idleMs = 0.0;
-                if (accWall >= 1000.0) {
-                    const double tps = std::clamp(accSteps / accWall * 1000.0, 30.0, 2000.0);
-                    const bool changed = std::fabs(tps - g_tps) / g_tps > 0.08;
-                    if (changed) g_tps = std::round(tps);
-                    if (changed || !firstLogged) {
-                        firstLogged = true;
-                        log::info("JW: measured tick rate {:.0f} TPS, using {:.0f} TPS for budgets (window {} ms = {} ticks)",
-                            tps, g_tps, g_windowMs, static_cast<int>(std::lround(g_windowMs * g_tps / 1000.0)));
-                    }
-                    accWall = accSteps = 0.0;
-                }
-            } else if (steps == 0) {
-                idleMs += frameMs;
-                if (idleMs > 200.0) { idleMs = 0.0; accWall = accSteps = 0.0; } // paused or in a menu
-            }
-        }
-
         auto* pl = PlayLayer::get();
         if (!pl) {
             reset();
@@ -523,7 +563,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 14 loaded (measured tick rate, saved-tick logging, same-tick wave tap preservation, macOS)");
+    log::info("JW: build 15 loaded (early clicks held back from the engine until legal, saved-tick logging, same-tick wave tap preservation, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -625,13 +665,22 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 return;
             }
 
-            // The press goes in right now; runBuffer keeps streaming it every
-            // physics step until the engine acknowledges it.
-            jw::logDecision("CUSHIONED: press forwarded at once, streamed until the engine acknowledges", p);
+            // Airborne with nothing to grab: the click is HELD BACK. The engine
+            // never sees it now; runBuffer delivers it on the first tick where
+            // it is legal (landed, or touching an orb).
+            const bool airborne = !p->m_isOnGround && jw::ringCount(p) == 0;
+            jw::logDecision(airborne
+                ? "CUSHIONED: early click held back, the engine sees nothing until it is legal"
+                : "CUSHIONED: press forwarded at once, streamed until the engine acknowledges", p);
             jw::logReplaced(w);
-            jw::flushSide(self, isPlayer1);       // a stale queued release goes first
+            if (w.active && w.deferred) jw::dropSide(isPlayer1);   // the older held-back tap never reached the engine
+            else                        jw::flushSide(self, isPlayer1);   // a stale queued release goes first
             jw::beginCushion(w, p);
             st.anyActive = true;
+            if (airborne) {
+                w.deferred = true;
+                return;                               // NOT passed to GJBaseGameLayer::handleButton
+            }
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
@@ -672,6 +721,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
 
         // Assist switched off (or level gone): never strand a queued input.
         if (!jw::assistActive()) {
+            jw::sendHeldBack(self);
             jw::flushAll(self);
             jw::resetSides();
             return;

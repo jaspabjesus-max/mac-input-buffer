@@ -5,6 +5,7 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 
+#include <chrono>
 #include <vector>
 
 using namespace geode::prelude;
@@ -58,6 +59,15 @@ namespace jw {
         return false;
     }
 
+    // Read-only latency diagnostics: these only log, they never change input.
+    inline int g_diagLogs = 0;
+    inline double clickAgeMs(bool mouse) {
+        const auto src = kCGEventSourceStateHIDSystemState;
+        const double a = CGEventSourceSecondsSinceLastEventType(
+            src, mouse ? kCGEventLeftMouseDown : kCGEventKeyDown);
+        return a < 0.0 ? -1.0 : a * 1000.0;
+    }
+
     inline void resetSides() {
         auto& s = state();
         s.sides[0] = Side{};
@@ -104,6 +114,13 @@ namespace jw {
 
     // Runs once per rendered frame, after the game's own update.
     inline void tick() {
+        // Diagnostic: time since the previous frame, in ms.
+        static auto lastFrame = std::chrono::steady_clock::now();
+        const auto nowFrame = std::chrono::steady_clock::now();
+        const double frameMs =
+            std::chrono::duration<double, std::milli>(nowFrame - lastFrame).count();
+        lastFrame = nowFrame;
+
         auto* pl = PlayLayer::get();
         if (!pl) {
             g_delayQ.clear();
@@ -112,6 +129,12 @@ namespace jw {
         }
 
         updateLabel(pl);
+
+        static int slowLogs = 0;
+        if (frameMs > 25.0 && slowLogs < 40) {
+            ++slowLogs;
+            log::info("JW: diag slow frame {:.1f} ms", frameMs);
+        }
 
         auto& st = state();
 
@@ -222,7 +245,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 3 loaded (ground clicks pass through, hold restored on expiry)");
+    log::info("JW: build 4 loaded (build 3 fixes + read-only latency diagnostics)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_window       = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-frames"));
@@ -246,6 +269,13 @@ class $modify(JWScheduler, CCScheduler) {
 class $modify(JWGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto& st = jw::state();
+
+        // Diagnostic: how old is this physical click when the game receives it?
+        if (down && !st.injecting && button == jw::kButtonJump && jw::g_diagLogs < 60) {
+            ++jw::g_diagLogs;
+            log::info("JW: diag click age at game: mouse {:.1f} ms, key {:.1f} ms",
+                jw::clickAgeMs(true), jw::clickAgeMs(false));
+        }
 
         if (st.injecting || button != jw::kButtonJump || !jw::assistActive()) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);

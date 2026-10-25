@@ -51,6 +51,7 @@ namespace jw {
         // Snapshot from the previous step, used to detect that the press took.
         bool     prevGround     = false;
         bool     prevUpsideDown = false;
+        int      prevRings      = 0;
         double   prevUp         = 0.0;
         uint64_t pressSeq       = 0;     // step counter when the press went in
         int      heldSteps      = 0;     // physics steps the press has been live
@@ -91,6 +92,7 @@ namespace jw {
     inline int  g_guardLogs    = 0;
     inline double g_stepsPerFrame = 4.0; // measured, read-only use (wave delay conversion)
 
+    inline double g_modUs = 0.0; // microseconds this mod spent since the last frame (diagnostic)
     inline std::vector<Event> g_queue;
     inline uint64_t g_seq      = 0;    // event ordering
     inline uint64_t g_stepSeq  = 0;    // physics-step counter (the only clock gameplay logic uses)
@@ -229,12 +231,15 @@ namespace jw {
         return static_cast<uint64_t>(std::max<long>(steps, g_waveDelay));
     }
 
+    inline void recordOutcome(const Side& w);
+
     inline void deliver(GJBaseGameLayer* layer, const Event& ev) {
         auto& st = state();
         const int i = sideIdx(ev.p1);
         if (ev.cushion && !ev.down) {
             auto& w = st.sides[i];
             if (w.active) {
+                recordOutcome(w);
                 PlayerObject* p = ev.p1 ? layer->m_player1 : layer->m_player2;
                 static int relLogs = 0;
                 if (relLogs < 300) {
@@ -299,7 +304,33 @@ namespace jw {
         w.pressRings     = ringCount(p);
         w.prevGround     = p->m_isOnGround;
         w.prevUpsideDown = p->m_isUpsideDown;
+        w.prevRings      = ringCount(p);
         w.prevUp         = upVel(p);
+    }
+
+    // ---------------------------------------------------------------------
+    // Outcome statistics (the per-click logs are capped; these are not)
+    // ---------------------------------------------------------------------
+    inline int g_outGroundAck = 0, g_outGroundMiss = 0;   // pressed on ground / on an orb
+    inline int g_outAirAck = 0,    g_outAirMiss = 0;      // pressed in the air with nothing in reach
+    inline long g_airAckStepsSum = 0;
+    inline int  g_airAckStepsMax = 0;
+
+    inline void recordOutcome(const Side& w) {
+        const bool air = !w.pressGround && w.pressRings == 0;
+        if (air) {
+            if (w.registered) { ++g_outAirAck; g_airAckStepsSum += w.heldSteps; g_airAckStepsMax = std::max(g_airAckStepsMax, w.heldSteps); }
+            else              { ++g_outAirMiss; }
+        } else {
+            if (w.registered) ++g_outGroundAck; else ++g_outGroundMiss;
+        }
+        const int total = g_outGroundAck + g_outGroundMiss + g_outAirAck + g_outAirMiss;
+        if (total % 10 == 0) {
+            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} steps, budget {} steps)",
+                total, g_outGroundAck, g_outGroundMiss, g_outAirAck, g_outAirMiss,
+                g_outAirAck > 0 ? static_cast<double>(g_airAckStepsSum) / g_outAirAck : 0.0,
+                g_airAckStepsMax, w.maxSteps);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -346,7 +377,12 @@ namespace jw {
                 const bool   onGround = p->m_isOnGround;
                 const bool   left     = w.prevGround && !onGround;
                 const bool   flipped  = p->m_isUpsideDown != w.prevUpsideDown;
-                const bool   kick     = !onGround && (upVel(p) - w.prevUp) > kRegisterDeltaV;
+                // A velocity change alone is NOT proof (pads, portals, slopes also
+                // change it). It only counts together with real orb contact,
+                // now or at the previous step; gravity orbs show up as `flipped`.
+                const bool   orbContact = ringCount(p) > 0 || w.prevRings > 0;
+                const bool   kick     = !onGround && orbContact
+                                        && std::fabs(upVel(p) - w.prevUp) > kRegisterDeltaV;
                 if (left || flipped || kick) w.registered = true;
             };
 
@@ -368,6 +404,7 @@ namespace jw {
             // Only now roll the snapshot forward, for the next step's comparison.
             w.prevGround     = p->m_isOnGround;
             w.prevUpsideDown = p->m_isUpsideDown;
+            w.prevRings      = ringCount(p);
             w.prevUp         = upVel(p);
 
             w.releaseOk = (w.registered && w.heldSteps >= kMinHoldSteps)
@@ -375,8 +412,9 @@ namespace jw {
 
             // Player is still holding and we are done: nothing to release, stop tracking.
             if (!w.releaseQueued && w.releaseOk) {
+                recordOutcome(w);
                 static int doneLogs = 0;
-                if (doneLogs < 100) {
+                if (doneLogs < 400) {
                     ++doneLogs;
                     log::info("JW: press tracking ended while held (registered: {}, held {}/{} steps, streamed {}, extended {})",
                         w.registered, w.heldSteps, w.maxSteps, w.streamed, w.extSteps);
@@ -391,6 +429,7 @@ namespace jw {
     // Runs once per rendered frame. Diagnostics and UI only: it delivers no
     // input and drives no gameplay logic.
     inline void tick() {
+        const auto tickStart = Clock::now();
         static auto lastFrame = Clock::now();
         static uint64_t lastSeq = g_stepSeq;
         const auto nowFrame = Clock::now();
@@ -415,14 +454,15 @@ namespace jw {
         static int slowLogs = 0;
         if (frameMs > 25.0 && slowLogs < 300) {
             ++slowLogs;
-            log::info("JW: diag slow frame {:.1f} ms ({} physics steps ran in it, assist tracking active: {})",
-                frameMs, steps, state().anyActive);
+            log::info("JW: diag slow frame {:.1f} ms ({} physics steps ran in it, assist tracking active: {}, this mod used {:.0f} us since last frame)",
+                frameMs, steps, state().anyActive, g_modUs + msBetween(tickStart, Clock::now()) * 1000.0);
         }
+        g_modUs = 0.0;
     }
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 12 loaded (fixed ack detection, orb-overlap extension, tick-locked wave queue, macOS)");
+    log::info("JW: build 13 loaded (orb-contact-gated ack, outcome stats, mod CPU timing, tick-locked wave queue, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -568,8 +608,10 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             return;
         }
 
+        const auto t0 = jw::Clock::now();
         jw::runBuffer(self);
         jw::pump(self);
+        jw::g_modUs += jw::msBetween(t0, jw::Clock::now()) * 1000.0;
     }
 };
 

@@ -3,26 +3,47 @@
     "gd": {
         "mac": "*"
     },
-    "version": "v1.1.0",
+    "version": "v1.5.0",
     "id": "developer.mac_input_buffer",
     "name": "MacARM Input Buffer",
     "developer": "Developer",
-    "description": "Widens tight jump timing windows by retrying clicks for a few physics frames.",
+    "description": "Holds early jump clicks until a ground jump or orb click is legal. Optional uniform wave input delay and wave input guard.",
     "settings": {
         "assist-enabled": {
             "type": "bool",
             "name": "Enabled",
-            "description": "Retry jump clicks for a few physics frames.",
+            "description": "Swallow early jump clicks and press once a jump is legal.",
             "default": true
+        },
+        "practice-only": {
+            "type": "bool",
+            "name": "Practice Mode only",
+            "description": "When on, the assist does nothing outside Practice Mode.",
+            "default": false
         },
         "window-frames": {
             "type": "int",
-            "name": "Window (physics frames)",
-            "description": "How many physics steps a click stays active. 1 = vanilla.",
-            "default": 3,
+            "name": "Window (display frames)",
+            "description": "How many rendered frames a click stays active. 1 = vanilla.",
+            "default": 2,
             "min": 1,
             "max": 20,
             "control": { "slider": true, "input": true }
+        },
+        "wave-delay": {
+            "type": "int",
+            "name": "Wave input delay (display frames)",
+            "description": "Delays wave presses and releases equally. 0 = off.",
+            "default": 0,
+            "min": 0,
+            "max": 6,
+            "control": { "slider": true, "input": true }
+        },
+        "wave-guard": {
+            "type": "bool",
+            "name": "Wave input guard",
+            "description": "Drops duplicate wave presses and releases a stuck hold only when the physical button is up. Never presses for you.",
+            "default": false
         }
     }
 }

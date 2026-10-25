@@ -200,24 +200,6 @@ namespace jw {
             }
         }
 
-        // Stuck-hold watchdog: release only if the hardware says the button is up.
-        if (g_waveGuard && g_delayQ.empty() && assistActive()) {
-            for (int i = 0; i < 2; ++i) {
-                if (!g_waveDown[i] || physicalJumpHeld()) { g_stuckFrames[i] = 0; continue; }
-                if (++g_stuckFrames[i] >= 3) {   // 3 frames avoids racing a normal release
-                    st.injecting = true;
-                    pl->handleButton(false, kButtonJump, i == 0);
-                    st.injecting = false;
-                    g_waveDown[i] = false;
-                    g_stuckFrames[i] = 0;
-                    if (g_guardLogs < 60) {
-                        ++g_guardLogs;
-                        log::info("JW: released stuck wave hold (side {}) - no key or mouse button was down", i);
-                    }
-                }
-            }
-        }
-
         if (!st.anyActive) return;
 
         // Assist switched off mid-buffer: stop immediately.
@@ -232,7 +214,15 @@ namespace jw {
 
             const bool p1 = (i == 0);
             PlayerObject* p = p1 ? pl->m_player1 : pl->m_player2;
-            if (!p || !isCubeLike(p)) { w = Side{}; continue; }
+            if (!p || !isCubeLike(p)) {
+                if (w.pressed && p) {   // do not leave our injected press held
+                    st.injecting = true;
+                    pl->handleButton(false, kButtonJump, p1);
+                    st.injecting = false;
+                }
+                w = Side{};
+                continue;
+            }
 
             auto send = [&](bool down) {
                 st.injecting = true;
@@ -240,27 +230,21 @@ namespace jw {
                 st.injecting = false;
             };
 
-            // 1. Did our last press make the jump fire? Then we are done.
+            // 1. We already pressed once for this click. ONE press per click:
+            //    never retry, because a retry would press the NEXT orb the
+            //    player reaches, an input they never made.
             if (w.pressed) {
-                if (jumpFired(p, w.wasGround)) {
-                    static int firedLogs = 0;
-                    if (firedLogs < 300) {
-                        ++firedLogs;
-                        log::info("JW: jump fired (clicked in air: {}, frames used: {}/{})",
-                            w.clickedInAir, g_window - w.framesLeft, g_window);
-                    }
-                    if (w.releaseDeferred) send(false);
-                    w = Side{};
-                    continue;
+                const bool fired = jumpFired(p, w.wasGround);
+                static int outcomeLogs = 0;
+                if (outcomeLogs < 300) {
+                    ++outcomeLogs;
+                    log::info("JW: press done (looks like a jump: {}, frames used: {}/{}, vel={:.2f}, ground={}, rings={})",
+                        fired, g_window - w.framesLeft, g_window,
+                        static_cast<double>(p->m_yVelocity), p->m_isOnGround, ringCount(p));
                 }
-                static int missLogs = 0;
-                if (missLogs < 150) {
-                    ++missLogs;
-                    log::info("JW: press did not register as a jump (vel={:.2f} ground={} wasGround={} rings={} framesLeft={})",
-                        static_cast<double>(p->m_yVelocity), p->m_isOnGround, w.wasGround, ringCount(p), w.framesLeft);
-                }
-                send(false);       // not legal after all: release so the next press is fresh
-                w.pressed = false;
+                if (w.releaseDeferred) send(false);   // player already let go
+                w = Side{};
+                continue;
             }
 
             // 2. Window used up: stop and apply any held-back release.
@@ -304,7 +288,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 6 loaded (click summary counters, wider logs, any-key wave guard)");
+    log::info("JW: build 7 loaded (one press per click, no retries, wave watchdog removed)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_window       = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-frames"));
@@ -393,6 +377,9 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             if (p->m_isOnGround || jw::touchingOrb(p)) {
                 jw::logDecision("PASS: on ground or touching orb", p);
                 jw::logReplaced(w);
+                if (w.active && w.pressed) {   // release our own injected press first
+                    GJBaseGameLayer::handleButton(false, button, isPlayer1);
+                }
                 w = jw::Side{};
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
                 return;
@@ -401,6 +388,9 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             // tick presses once a jump becomes legal.
             jw::logDecision("SWALLOWED: airborne, holding click for the window", p);
             jw::logReplaced(w);
+            if (w.active && w.pressed) {       // release our own injected press first
+                GJBaseGameLayer::handleButton(false, button, isPlayer1);
+            }
             w = jw::Side{};
             w.active     = true;
             w.framesLeft = jw::g_window;

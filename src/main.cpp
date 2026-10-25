@@ -18,6 +18,7 @@ namespace jw {
         bool releaseDeferred = false; // player let go while we were holding
         bool pressed         = false; // we have a press in flight
         bool wasGround       = false;
+        bool clickedInAir    = false; // diagnostic: was the click made while airborne
         int  framesLeft      = 0;
     };
 
@@ -172,7 +173,12 @@ namespace jw {
             // 1. Did our last press make the jump fire? Then we are done.
             if (w.pressed) {
                 if (jumpFired(p, w.wasGround)) {
-                    log::info("JW: jump fired, buffer done");
+                    static int firedLogs = 0;
+                    if (firedLogs < 30) {
+                        ++firedLogs;
+                        log::info("JW: jump fired (clicked in air: {}, frames used: {}/{})",
+                            w.clickedInAir, g_window - w.framesLeft, g_window);
+                    }
                     if (w.releaseDeferred) send(false);
                     w = Side{};
                     continue;
@@ -183,6 +189,11 @@ namespace jw {
 
             // 2. Window used up: stop and apply any held-back release.
             if (w.framesLeft <= 0) {
+                static int expiredLogs = 0;
+                if (expiredLogs < 30) {
+                    ++expiredLogs;
+                    log::info("JW: buffer expired, no jump (clicked in air: {})", w.clickedInAir);
+                }
                 if (w.releaseDeferred) send(false);
                 w = Side{};
                 continue;
@@ -270,6 +281,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             w = jw::Side{};
             w.active     = true;
             w.framesLeft = jw::g_window;
+            w.clickedInAir = p && !p->m_isOnGround;
             st.anyActive = true;
             return;
         }

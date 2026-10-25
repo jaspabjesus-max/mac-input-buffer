@@ -106,6 +106,19 @@ namespace jw {
         return (wasGround && !p->m_isOnGround) || up > kJumpVel;
     }
 
+    // Diagnostic: which path did a real click take, and why?
+    inline int g_decisionLogs = 0;
+    inline void logDecision(const char* why, PlayerObject* p) {
+        if (g_decisionLogs >= 80) return;
+        ++g_decisionLogs;
+        log::info("JW: click -> {} | window={} ground={} orb={} ship={} ufo={} ball={} wave={} robot={} spider={} swing={}",
+            why, g_window,
+            p ? p->m_isOnGround : false, touchingOrb(p),
+            p ? p->m_isShip : false, p ? p->m_isBird : false, p ? p->m_isBall : false,
+            p ? p->m_isDart : false, p ? p->m_isRobot : false, p ? p->m_isSpider : false,
+            p ? p->m_isSwing : false);
+    }
+
     inline void updateLabel(PlayLayer* pl) {
         if (auto* label = pl->getChildByID("jw-label")) {
             label->setVisible(assistActive());
@@ -233,6 +246,12 @@ namespace jw {
 
             // 3. Only press when a jump can actually happen.
             if (p->m_isOnGround || touchingOrb(p)) {
+                static int pressLogs = 0;
+                if (pressLogs < 60) {
+                    ++pressLogs;
+                    log::info("JW: tick pressed (ground={} orb={} framesLeft={})",
+                        p->m_isOnGround, touchingOrb(p), w.framesLeft);
+                }
                 w.wasGround = p->m_isOnGround;
                 send(true);
                 w.pressed = true;
@@ -245,16 +264,21 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 4 loaded (build 3 fixes + read-only latency diagnostics)");
+    log::info("JW: build 5 loaded (decision logging)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_window       = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-frames"));
     jw::g_waveDelay    = static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-delay"));
+    log::info("JW: loaded settings enabled={} practiceOnly={} window={} waveDelay={}",
+        jw::g_enabled, jw::g_practiceOnly, jw::g_window, jw::g_waveDelay);
     jw::g_waveGuard    = Mod::get()->getSettingValue<bool>("wave-guard");
 
     listenForSettingChanges<bool>("assist-enabled",   [](bool v)    { jw::g_enabled = v; });
     listenForSettingChanges<bool>("practice-only",    [](bool v)    { jw::g_practiceOnly = v; });
-    listenForSettingChanges<int64_t>("window-frames", [](int64_t v) { jw::g_window = static_cast<int>(v); });
+    listenForSettingChanges<int64_t>("window-frames", [](int64_t v) {
+        jw::g_window = static_cast<int>(v);
+        log::info("JW: window changed to {}", jw::g_window);
+    });
     listenForSettingChanges<int64_t>("wave-delay",    [](int64_t v) { jw::g_waveDelay = static_cast<int>(v); });
     listenForSettingChanges<bool>("wave-guard",       [](bool v)    { jw::g_waveGuard = v; });
 }
@@ -278,6 +302,12 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         }
 
         if (st.injecting || button != jw::kButtonJump || !jw::assistActive()) {
+            if (down && !st.injecting && button == jw::kButtonJump) {
+                jw::logDecision(
+                    jw::g_enabled ? "PASS: assist inactive (practice-only outside practice, or no level)"
+                                  : "PASS: assist inactive (Enabled is off)",
+                    isPlayer1 ? m_player1 : m_player2);
+            }
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
@@ -314,18 +344,21 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         if (down) {
             // Window of 1 or non-cube-like modes: vanilla behavior.
             if (jw::g_window <= 1 || !jw::isCubeLike(p)) {
+                jw::logDecision("PASS: window is 1 or mode not supported", p);
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
                 return;
             }
             // Jump is already legal (on ground or touching an orb): vanilla
             // timing, no swallow and no added latency.
             if (p->m_isOnGround || jw::touchingOrb(p)) {
+                jw::logDecision("PASS: on ground or touching orb", p);
                 w = jw::Side{};
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
                 return;
             }
             // Airborne with nothing to click yet: swallow the click; the
             // tick presses once a jump becomes legal.
+            jw::logDecision("SWALLOWED: airborne, holding click for the window", p);
             w = jw::Side{};
             w.active     = true;
             w.framesLeft = jw::g_window;

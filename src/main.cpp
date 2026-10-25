@@ -36,9 +36,16 @@ namespace jw {
     // i.e. a frozen/stuck state; normal overlaps end long before this.
     constexpr int    kHardCapSteps = 120;
 
-    // Game physics runs at 240 steps per second; used once, to turn the
-    // window-ms setting into a STEP budget when a click arrives.
-    constexpr double kStepMs = 1000.0 / 240.0;
+    // Nominal physics rate. The real rate is measured at runtime (g_tps) and
+    // used to turn the window-ms setting into a tick budget when a click arrives.
+    constexpr double kNominalTps = 240.0;
+
+    // Wave: every input edge (press or release) must stay live for at least
+    // this many physics ticks. Two edges that arrive in the SAME tick (a fast
+    // tap: press+release, or release+press) would otherwise cancel out and the
+    // wave would never change direction. The second edge is pushed to the
+    // next tick instead, so the tap is preserved.
+    constexpr uint64_t kWaveMinGapSteps = 1;
 
     // One cushioned press per player side.
     struct Side {
@@ -55,6 +62,7 @@ namespace jw {
         double   prevUp         = 0.0;
         uint64_t pressSeq       = 0;     // step counter when the press went in
         int      heldSteps      = 0;     // physics steps the press has been live
+        int      ackSteps       = 0;     // ticks between the press and the engine acting on it
         int      maxSteps       = 0;     // step budget (stutter-proof, game time)
         int      streamed       = 0;     // extra presses streamed while waiting
         int      extSteps       = 0;     // steps spent past the budget because an orb overlap was live
@@ -91,12 +99,15 @@ namespace jw {
     inline bool g_waveDown[2]  = {false, false};
     inline int  g_guardLogs    = 0;
     inline double g_stepsPerFrame = 4.0; // measured, read-only use (wave delay conversion)
+    inline double g_tps = kNominalTps;   // measured ticks per second (hook calls per wall second)
+    inline int    g_waveEvents = 0, g_waveSpaced = 0; // wave inputs seen / saved from a same-tick collision
 
     inline double g_modUs = 0.0; // microseconds this mod spent since the last frame (diagnostic)
     inline std::vector<Event> g_queue;
     inline uint64_t g_seq      = 0;    // event ordering
     inline uint64_t g_stepSeq  = 0;    // physics-step counter (the only clock gameplay logic uses)
     inline uint64_t g_lastDue[2] = {0, 0};
+    inline uint64_t g_lastDelivered[2] = {0, 0}; // tick of the last input actually delivered, per side
 
     inline double msBetween(Clock::time_point from, Clock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();
@@ -125,6 +136,7 @@ namespace jw {
         resetSides();
         g_queue.clear();
         refreshLastDue();
+        g_lastDelivered[0] = g_lastDelivered[1] = 0;
         g_waveDown[0] = g_waveDown[1] = false;
     }
 
@@ -217,11 +229,20 @@ namespace jw {
 
     // Queue an input for a physics tick. Per side, due ticks never go
     // backwards, so presses and releases can never swap places.
-    inline void enqueue(bool down, bool p1, uint64_t dueStep, bool cushion) {
+    // minGap > 0: this input must be at least minGap ticks after the previous
+    // input of the same side (queued or already delivered). Returns true when
+    // that pushed it later than it would otherwise have been.
+    inline bool enqueue(bool down, bool p1, uint64_t dueStep, bool cushion, uint64_t minGap = 0) {
         const int i = sideIdx(p1);
         if (dueStep < g_lastDue[i]) dueStep = g_lastDue[i];
+        bool spaced = false;
+        if (minGap > 0) {
+            const uint64_t earliest = std::max(g_lastDue[i], g_lastDelivered[i]) + minGap;
+            if (dueStep < earliest) { dueStep = earliest; spaced = true; }
+        }
         g_lastDue[i] = dueStep;
         g_queue.push_back(Event{dueStep, ++g_seq, down, p1, cushion});
+        return spaced;
     }
 
     // Wave delay is configured in frames; the queue counts physics ticks.
@@ -244,17 +265,16 @@ namespace jw {
                 static int relLogs = 0;
                 if (relLogs < 300) {
                     ++relLogs;
-                    log::info("JW: cushion release via {} (held {}/{} steps, streamed {} extra presses, {} steps past budget on an orb, registered: {}, diag wall {:.1f} ms, pressed on ground={} rings={}, now ground={} rings={}, old test: {})",
-                        w.registered ? "engine ack" : "step budget end", w.heldSteps, w.maxSteps, w.streamed, w.extSteps,
-                        w.registered, msBetween(w.clickTime, Clock::now()),
-                        w.pressGround, w.pressRings,
-                        p ? p->m_isOnGround : false, ringCount(p),
-                        p ? jumpFired(p, w.pressGround) : false);
+                    log::info("JW: cushion release via {} (held {}/{} ticks, acked after {} ticks, streamed {} extra presses, {} ticks past budget on an orb, registered: {}, pressed on ground={} rings={}, now ground={} rings={})",
+                        w.registered ? "engine ack" : "budget end (jump never became legal)", w.heldSteps, w.maxSteps, w.ackSteps,
+                        w.streamed, w.extSteps, w.registered, w.pressGround, w.pressRings,
+                        p ? p->m_isOnGround : false, ringCount(p));
                 }
             }
             st.sides[i] = Side{};
             st.anyActive = st.sides[0].active || st.sides[1].active;
         }
+        g_lastDelivered[sideIdx(ev.p1)] = g_stepSeq;
         inject(layer, ev.down, ev.p1);
     }
 
@@ -299,7 +319,7 @@ namespace jw {
         w.clickTime      = Clock::now();   // diagnostics only
         w.pressSeq       = g_stepSeq;
         w.maxSteps       = std::max(kMinHoldSteps,
-                               static_cast<int>(std::lround(static_cast<double>(g_windowMs) / kStepMs)));
+                               static_cast<int>(std::lround(static_cast<double>(g_windowMs) * g_tps / 1000.0)));
         w.pressGround    = p->m_isOnGround;
         w.pressRings     = ringCount(p);
         w.prevGround     = p->m_isOnGround;
@@ -315,21 +335,23 @@ namespace jw {
     inline int g_outAirAck = 0,    g_outAirMiss = 0;      // pressed in the air with nothing in reach
     inline long g_airAckStepsSum = 0;
     inline int  g_airAckStepsMax = 0;
+    inline int  g_savedClicks = 0;  // early taps the buffer carried to a legal tick
+    inline long g_savedTicks  = 0;  // total ticks those taps were carried for
 
     inline void recordOutcome(const Side& w) {
         const bool air = !w.pressGround && w.pressRings == 0;
         if (air) {
-            if (w.registered) { ++g_outAirAck; g_airAckStepsSum += w.heldSteps; g_airAckStepsMax = std::max(g_airAckStepsMax, w.heldSteps); }
+            if (w.registered) { ++g_outAirAck; g_airAckStepsSum += w.ackSteps; g_airAckStepsMax = std::max(g_airAckStepsMax, w.ackSteps); }
             else              { ++g_outAirMiss; }
         } else {
             if (w.registered) ++g_outGroundAck; else ++g_outGroundMiss;
         }
         const int total = g_outGroundAck + g_outGroundMiss + g_outAirAck + g_outAirMiss;
         if (total % 10 == 0) {
-            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} steps, budget {} steps)",
+            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} ticks, budget {} ticks, {} ticks saved in total)",
                 total, g_outGroundAck, g_outGroundMiss, g_outAirAck, g_outAirMiss,
                 g_outAirAck > 0 ? static_cast<double>(g_airAckStepsSum) / g_outAirAck : 0.0,
-                g_airAckStepsMax, w.maxSteps);
+                g_airAckStepsMax, w.maxSteps, g_savedTicks);
         }
     }
 
@@ -383,7 +405,20 @@ namespace jw {
                 const bool   orbContact = ringCount(p) > 0 || w.prevRings > 0;
                 const bool   kick     = !onGround && orbContact
                                         && std::fabs(upVel(p) - w.prevUp) > kRegisterDeltaV;
-                if (left || flipped || kick) w.registered = true;
+                if (left || flipped || kick) {
+                    w.registered = true;
+                    w.ackSteps = static_cast<int>(g_stepSeq - w.pressSeq);
+                    if (!w.pressGround && w.pressRings == 0) {   // an early tap: this is a saved click
+                        ++g_savedClicks;
+                        g_savedTicks += w.ackSteps;
+                        static int savedLogs = 0;
+                        if (savedLogs < 300) {
+                            ++savedLogs;
+                            log::info("JW: SAVED early click #{}: jump fired {} ticks ({:.1f} ms at {:.0f} TPS) after the press",
+                                g_savedClicks, w.ackSteps, w.ackSteps * 1000.0 / g_tps, g_tps);
+                        }
+                    }
+                }
             };
 
             detect();   // catches a press that took inside handleButton / the previous streamed press
@@ -443,6 +478,32 @@ namespace jw {
             g_stepsPerFrame = std::clamp(g_stepsPerFrame * 0.9 + static_cast<double>(steps) * 0.1, 1.0, 16.0);
         }
 
+        // Measure the real tick rate over ~1 s windows. Steps inside a frame run
+        // back to back, so only an average over many frames is meaningful.
+        {
+            static double accWall = 0.0, accSteps = 0.0, idleMs = 0.0;
+            static bool firstLogged = false;
+            if (steps > 0 && steps <= 64) {
+                accWall  += frameMs + idleMs;
+                accSteps += static_cast<double>(steps);
+                idleMs = 0.0;
+                if (accWall >= 1000.0) {
+                    const double tps = std::clamp(accSteps / accWall * 1000.0, 30.0, 2000.0);
+                    const bool changed = std::fabs(tps - g_tps) / g_tps > 0.08;
+                    if (changed) g_tps = std::round(tps);
+                    if (changed || !firstLogged) {
+                        firstLogged = true;
+                        log::info("JW: measured tick rate {:.0f} TPS, using {:.0f} TPS for budgets (window {} ms = {} ticks)",
+                            tps, g_tps, g_windowMs, static_cast<int>(std::lround(g_windowMs * g_tps / 1000.0)));
+                    }
+                    accWall = accSteps = 0.0;
+                }
+            } else if (steps == 0) {
+                idleMs += frameMs;
+                if (idleMs > 200.0) { idleMs = 0.0; accWall = accSteps = 0.0; } // paused or in a menu
+            }
+        }
+
         auto* pl = PlayLayer::get();
         if (!pl) {
             reset();
@@ -462,7 +523,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 13 loaded (orb-contact-gated ack, outcome stats, mod CPU timing, tick-locked wave queue, macOS)");
+    log::info("JW: build 14 loaded (measured tick rate, saved-tick logging, same-tick wave tap preservation, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -540,7 +601,15 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 jw::g_waveDown[side] = down;
             }
             if (w.active) w = jw::Side{};     // left cube-like mode with a cushion pending
-            jw::enqueue(down, isPlayer1, jw::g_stepSeq + jw::waveDelaySteps(), false);
+            const bool spaced = jw::enqueue(down, isPlayer1, jw::g_stepSeq + jw::waveDelaySteps(), false, jw::kWaveMinGapSteps);
+            ++jw::g_waveEvents;
+            if (spaced) {
+                ++jw::g_waveSpaced;
+                if (jw::g_waveSpaced <= 60 || jw::g_waveSpaced % 25 == 0) {
+                    log::info("JW: wave {} arrived in the same tick as the previous wave input -> pushed one tick later so the tap is not swallowed (saved {} of {} wave inputs)",
+                        down ? "press" : "release", jw::g_waveSpaced, jw::g_waveEvents);
+                }
+            }
             if (jw::g_inTick) jw::pump(self);
             return;
         }

@@ -31,6 +31,11 @@ namespace jw {
     // Sub-tick hold cushion: a cushioned press stays down at least this many physics steps.
     constexpr int    kMinHoldSteps = 3;
 
+    // Ceiling for the "stay on the orb" extension (see runBuffer): 0.5 s of
+    // game time. Only reachable if the player stays inside an orb's overlap,
+    // i.e. a frozen/stuck state; normal overlaps end long before this.
+    constexpr int    kHardCapSteps = 120;
+
     // Game physics runs at 240 steps per second; used once, to turn the
     // window-ms setting into a STEP budget when a click arrives.
     constexpr double kStepMs = 1000.0 / 240.0;
@@ -51,6 +56,7 @@ namespace jw {
         int      heldSteps      = 0;     // physics steps the press has been live
         int      maxSteps       = 0;     // step budget (stutter-proof, game time)
         int      streamed       = 0;     // extra presses streamed while waiting
+        int      extSteps       = 0;     // steps spent past the budget because an orb overlap was live
         Clock::time_point clickTime{};   // diagnostics only
     };
 
@@ -233,8 +239,8 @@ namespace jw {
                 static int relLogs = 0;
                 if (relLogs < 300) {
                     ++relLogs;
-                    log::info("JW: cushion release via {} (held {}/{} steps, streamed {} extra presses, registered: {}, diag wall {:.1f} ms, pressed on ground={} rings={}, now ground={} rings={}, old test: {})",
-                        w.registered ? "engine ack" : "step budget end", w.heldSteps, w.maxSteps, w.streamed,
+                    log::info("JW: cushion release via {} (held {}/{} steps, streamed {} extra presses, {} steps past budget on an orb, registered: {}, diag wall {:.1f} ms, pressed on ground={} rings={}, now ground={} rings={}, old test: {})",
+                        w.registered ? "engine ack" : "step budget end", w.heldSteps, w.maxSteps, w.streamed, w.extSteps,
                         w.registered, msBetween(w.clickTime, Clock::now()),
                         w.pressGround, w.pressRings,
                         p ? p->m_isOnGround : false, ringCount(p),
@@ -300,11 +306,19 @@ namespace jw {
     // Per-step supervision: stream the press until the engine acknowledges it
     // ---------------------------------------------------------------------
     //
-    // No clock, no contact flag. Every physics step the press is sent again
-    // (handleButton(true)) until the engine shows the press took: left the
-    // ground, gravity flipped, or an upward velocity jump far larger than one
-    // step of gravity. The only bound is a step budget, so a stutter (many
-    // steps in one frame, or one slow frame) cannot expire an input early.
+    // Every physics step the press is sent again (handleButton(true)) until
+    // the engine shows the press took: left the ground, gravity flipped, or an
+    // upward velocity jump far larger than one step of gravity.
+    //
+    // IMPORTANT: a jump or orb fires INSIDE handleButton, so the comparison
+    // snapshot must stay at its pre-press value until the check has run, and
+    // the check runs again right after every streamed press. (Build 11
+    // refreshed the snapshot too early and never saw a single ground jump.)
+    //
+    // Budget: normally the step budget derived from window-ms. If the player
+    // is overlapping an orb (m_touchingRings) and the press is still
+    // unacknowledged, the budget is ignored and the stream keeps going until
+    // the engine acknowledges or the overlap ends (kHardCapSteps as a rail).
     inline void runBuffer(GJBaseGameLayer* layer) {
         auto& st = state();
         if (!st.anyActive) return;
@@ -325,37 +339,47 @@ namespace jw {
 
             w.heldSteps = static_cast<int>(g_stepSeq - w.pressSeq);
 
-            const bool   onGround = p->m_isOnGround;
-            const double up       = upVel(p);
-
-            // Acknowledgement, judged against the PREVIOUS step. Landing is
+            // Did the press take, judged against the snapshot? Landing is
             // excluded (ground contact zeroes velocity, which is not a jump).
-            if (!w.registered && w.heldSteps >= 1) {
-                const bool left    = w.prevGround && !onGround;
-                const bool flipped = p->m_isUpsideDown != w.prevUpsideDown;
-                const bool kick    = !onGround && (up - w.prevUp) > kRegisterDeltaV;
+            auto detect = [&]() {
+                if (w.registered) return;
+                const bool   onGround = p->m_isOnGround;
+                const bool   left     = w.prevGround && !onGround;
+                const bool   flipped  = p->m_isUpsideDown != w.prevUpsideDown;
+                const bool   kick     = !onGround && (upVel(p) - w.prevUp) > kRegisterDeltaV;
                 if (left || flipped || kick) w.registered = true;
-            }
-            w.prevGround     = onGround;
-            w.prevUpsideDown = p->m_isUpsideDown;
-            w.prevUp         = up;
+            };
+
+            detect();   // catches a press that took inside handleButton / the previous streamed press
+
+            const bool overBudget = w.heldSteps >= w.maxSteps;
+            const bool nearOrb    = ringCount(p) > 0;
+            const bool extend     = !w.registered && overBudget && nearOrb && w.heldSteps < kHardCapSteps;
 
             // Continuous streaming: one more press on every sub-tick cycle
-            // until acknowledged (or the step budget is spent).
-            if (!w.registered && w.heldSteps >= 1 && w.heldSteps < w.maxSteps) {
+            // until acknowledged. The first press already went in with the click.
+            if (!w.registered && w.heldSteps >= 1 && (!overBudget || extend)) {
                 inject(layer, true, p1);
                 ++w.streamed;
+                if (overBudget) ++w.extSteps;
+                detect();   // the streamed press may itself have fired the jump
             }
 
-            w.releaseOk = (w.registered && w.heldSteps >= kMinHoldSteps) || w.heldSteps >= w.maxSteps;
+            // Only now roll the snapshot forward, for the next step's comparison.
+            w.prevGround     = p->m_isOnGround;
+            w.prevUpsideDown = p->m_isUpsideDown;
+            w.prevUp         = upVel(p);
+
+            w.releaseOk = (w.registered && w.heldSteps >= kMinHoldSteps)
+                       || (overBudget && !extend);
 
             // Player is still holding and we are done: nothing to release, stop tracking.
             if (!w.releaseQueued && w.releaseOk) {
                 static int doneLogs = 0;
                 if (doneLogs < 100) {
                     ++doneLogs;
-                    log::info("JW: press tracking ended while held (registered: {}, held {}/{} steps, streamed {})",
-                        w.registered, w.heldSteps, w.maxSteps, w.streamed);
+                    log::info("JW: press tracking ended while held (registered: {}, held {}/{} steps, streamed {}, extended {})",
+                        w.registered, w.heldSteps, w.maxSteps, w.streamed, w.extSteps);
                 }
                 w = Side{};
             }
@@ -389,15 +413,16 @@ namespace jw {
         updateLabel(pl);
 
         static int slowLogs = 0;
-        if (frameMs > 25.0 && slowLogs < 20) {
+        if (frameMs > 25.0 && slowLogs < 300) {
             ++slowLogs;
-            log::info("JW: diag slow frame {:.1f} ms", frameMs);
+            log::info("JW: diag slow frame {:.1f} ms ({} physics steps ran in it, assist tracking active: {})",
+                frameMs, steps, state().anyActive);
         }
     }
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 11 loaded (step-budget stream, engine-ack hold, tick-locked wave queue, macOS)");
+    log::info("JW: build 12 loaded (fixed ack detection, orb-overlap extension, tick-locked wave queue, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));

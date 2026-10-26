@@ -47,6 +47,27 @@ namespace jw {
     // next tick instead, so the tap is preserved.
     constexpr uint64_t kWaveMinGapSteps = 1;
 
+    // Predictive layer.
+    constexpr int kPredictHorizon    = 90;  // ticks the landing predictor looks ahead
+    constexpr int kPredictExtraSteps = 8;   // a held-back click may outlive the window by this much if landing is predicted
+    constexpr int kCoyoteMinSteps    = 2;   // late-jump grace after walking off an edge (scaled from window-ms, clamped)
+    constexpr int kCoyoteMaxSteps    = 6;
+
+    // Per-side motion tracker, updated once per tick BEFORE inputs are processed.
+    // All heights are in "up" coordinates (flipped when gravity is flipped).
+    struct Track {
+        bool     wasGround     = false;
+        bool     haveGround    = false;
+        bool     fellOff       = false;  // left the ground without jumping (walked off an edge)
+        bool     usedCoyote    = false;  // the late jump for this fall has been spent
+        bool     upsideKey     = false;
+        int      samples       = 0;
+        int      coyoteSince   = 0;      // ticks since ground when the late jump was granted
+        uint64_t lastGroundSeq = 0;
+        double   groundY       = 0.0;    // up-coordinate of the last ground contact
+        double   Y0 = 0.0, Y1 = 0.0, Y2 = 0.0; // up-coordinate now / one tick ago / two ticks ago
+    };
+
     // One cushioned press per player side.
     struct Side {
         bool     active         = false; // a press we are streaming/cushioning is in flight
@@ -56,6 +77,7 @@ namespace jw {
         bool     registered     = false; // the engine acted on the press
         bool     pressGround    = false; // diagnostics
         int      pressRings     = 0;     // diagnostics
+        int      predTicks      = -1;    // landing predicted at click time (-1: no prediction)
         // Snapshot from the previous step, used to detect that the press took.
         bool     prevGround     = false;
         bool     prevUpsideDown = false;
@@ -110,6 +132,10 @@ namespace jw {
     inline uint64_t g_stepSeq  = 0;    // physics-step counter (the only clock gameplay logic uses)
     inline uint64_t g_lastDue[2] = {0, 0};
     inline uint64_t g_lastDelivered[2] = {0, 0}; // tick of the last input actually delivered, per side
+    inline Track    g_track[2];
+    inline int      g_predN = 0;          // landing predictions that were checked against reality
+    inline long     g_predErrAbs = 0;     // sum of |actual - predicted| ticks
+    inline int      g_coyoteTried = 0, g_coyoteOk = 0;
 
     inline double msBetween(Clock::time_point from, Clock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();
@@ -139,6 +165,7 @@ namespace jw {
         g_queue.clear();
         refreshLastDue();
         g_lastDelivered[0] = g_lastDelivered[1] = 0;
+        g_track[0] = g_track[1] = Track{};
         g_waveDown[0] = g_waveDown[1] = false;
     }
 
@@ -162,6 +189,86 @@ namespace jw {
     inline double upVel(PlayerObject* p) {
         const double vel = static_cast<double>(p->m_yVelocity);
         return p->m_isUpsideDown ? -vel : vel;
+    }
+
+    // ---- Predictive layer -------------------------------------------------
+    // Called once per tick before the engine processes queued inputs.
+    inline void trackAir(GJBaseGameLayer* layer) {
+        for (int i = 0; i < 2; ++i) {
+            PlayerObject* p = (i == 0) ? layer->m_player1 : layer->m_player2;
+            Track& t = g_track[i];
+            if (!p || !isCubeLike(p)) { t = Track{}; continue; }
+
+            if (t.samples > 0 && p->m_isUpsideDown != t.upsideKey) t.samples = 0;   // gravity flip breaks the trajectory
+            t.upsideKey = p->m_isUpsideDown;
+
+            const double Y = (p->m_isUpsideDown ? -1.0 : 1.0) * static_cast<double>(p->getPositionY());
+            t.Y2 = t.Y1; t.Y1 = t.Y0; t.Y0 = Y;
+            if (t.samples < 3) ++t.samples;
+
+            if (p->m_isOnGround) {
+                t.lastGroundSeq = g_stepSeq;
+                t.groundY       = Y;
+                t.haveGround    = true;
+                t.fellOff       = false;
+                t.usedCoyote    = false;
+            } else if (t.wasGround) {
+                t.fellOff = upVel(p) <= 0.0;   // left the ground NOT rising = walked off an edge
+            }
+            t.wasGround = p->m_isOnGround;
+        }
+    }
+
+    // Kinematic landing predictor. Learns the per-tick acceleration from the last
+    // three positions (so it needs no hardcoded gravity, speed or size) and rolls
+    // the arc forward until it returns to the last ground height. Returns the
+    // number of ticks until landing, or -1 when it cannot say (no ground height
+    // known, not under gravity, or the arc does not come back inside the horizon).
+    // It assumes landing at the same height; platforms at other heights make it
+    // wrong, which is why it only ever EXTENDS a window by a bounded amount.
+    inline int predictLanding(const Track& t) {
+        if (!t.haveGround || t.samples < 3) return -1;
+        double dy = t.Y0 - t.Y1;
+        const double a = dy - (t.Y1 - t.Y2);
+        if (a > -0.01) return -1;
+        double Y = t.Y0;
+        for (int n = 1; n <= kPredictHorizon; ++n) {
+            dy += a;
+            Y  += dy;
+            if (Y <= t.groundY) return n;
+        }
+        return -1;
+    }
+
+    // Late-jump grace ("coyote time"): a click that arrives a few ticks after the
+    // player walked off an edge (without jumping) is treated as if it were still
+    // on the ground. Marks the player grounded for this one press; finishCoyote()
+    // checks whether the engine really jumped and undoes the flag if not.
+    inline bool tryCoyote(PlayerObject* p, bool p1) {
+        if (g_windowMs <= 0 || p->m_isOnGround || ringCount(p) > 0) return false;
+        Track& t = g_track[sideIdx(p1)];
+        if (!t.haveGround || !t.fellOff || t.usedCoyote) return false;
+        const int windowSteps = static_cast<int>(std::lround(static_cast<double>(g_windowMs) * g_tps / 1000.0));
+        const int coyoteSteps = std::clamp(windowSteps / 4, kCoyoteMinSteps, kCoyoteMaxSteps);
+        const uint64_t since  = g_stepSeq - t.lastGroundSeq;
+        if (since > static_cast<uint64_t>(coyoteSteps)) return false;
+        t.usedCoyote  = true;
+        t.coyoteSince = static_cast<int>(since);
+        ++g_coyoteTried;
+        p->m_isOnGround = true;
+        return true;
+    }
+
+    inline void finishCoyote(PlayerObject* p, bool p1) {
+        const bool jumped = !p->m_isOnGround || upVel(p) > kRegisterDeltaV;
+        if (jumped) ++g_coyoteOk;
+        else        p->m_isOnGround = false;      // the engine did not jump here: undo the flag
+        static int logs = 0;
+        if (logs < 200) {
+            ++logs;
+            log::info("JW: COYOTE late jump ({} ticks after leaving the ground): engine jumped inside handleButton: {} [{} of {} so far]",
+                g_track[sideIdx(p1)].coyoteSince, jumped ? "YES" : "NO (flag undone)", g_coyoteOk, g_coyoteTried);
+        }
     }
 
     // Used for logging only: does the player's state look like a jump just fired?
@@ -370,10 +477,12 @@ namespace jw {
         }
         const int total = g_outGroundAck + g_outGroundMiss + g_outAirAck + g_outAirMiss;
         if (total % 10 == 0) {
-            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} ticks, budget {} ticks, {} ticks saved in total)",
+            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} ticks, budget {} ticks, {} ticks saved in total) | predictor: {} checked, mean error {:.1f} ticks | coyote: {}/{} jumped",
                 total, g_outGroundAck, g_outGroundMiss, g_outAirAck, g_outAirMiss,
                 g_outAirAck > 0 ? static_cast<double>(g_airAckStepsSum) / g_outAirAck : 0.0,
-                g_airAckStepsMax, w.maxSteps, g_savedTicks);
+                g_airAckStepsMax, w.maxSteps, g_savedTicks,
+                g_predN, g_predN > 0 ? static_cast<double>(g_predErrAbs) / g_predN : 0.0,
+                g_coyoteOk, g_coyoteTried);
         }
     }
 
@@ -434,13 +543,27 @@ namespace jw {
                     snapshot();                       // judge the press against the state right before it
                     w.deferred = false;
                     w.sentSeq  = g_stepSeq;
+                    if (w.predTicks >= 0 && p->m_isOnGround) {          // check the predictor against reality
+                        ++g_predN;
+                        g_predErrAbs += std::abs(age - w.predTicks);
+                    }
                     static int sendLogs = 0;
                     if (sendLogs < 300) {
                         ++sendLogs;
-                        log::info("JW: held-back click delivered to the engine {} ticks after the click ({})",
-                            age, p->m_isOnGround ? "landed" : "orb contact");
+                        log::info("JW: held-back click delivered to the engine {} ticks after the click ({}; predicted landing in {} ticks)",
+                            age, p->m_isOnGround ? "landed" : "orb contact", w.predTicks);
                     }
                     inject(layer, true, p1);
+                } else if (const int pred = predictLanding(g_track[i]);
+                           age >= w.maxSteps && pred >= 0 && age + pred <= w.maxSteps + kPredictExtraSteps) {
+                    // Past the window, but the predictor says landing is imminent: keep holding.
+                    static int extLogs = 0;
+                    if (age == w.maxSteps && extLogs < 100) {
+                        ++extLogs;
+                        log::info("JW: window over at {} ticks, predictor says landing in {} more: still holding", age, pred);
+                    }
+                    snapshot();
+                    continue;
                 } else if (age >= w.maxSteps) {
                     // Too early: no legal moment inside the window.
                     recordOutcome(w);
@@ -563,7 +686,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 15 loaded (early clicks held back from the engine until legal, saved-tick logging, same-tick wave tap preservation, macOS)");
+    log::info("JW: build 16 loaded (held-back early clicks, landing predictor, coyote late jump, same-tick wave tap preservation, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -668,6 +791,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             // Airborne with nothing to grab: the click is HELD BACK. The engine
             // never sees it now; runBuffer delivers it on the first tick where
             // it is legal (landed, or touching an orb).
+            const bool coyote   = jw::tryCoyote(p, isPlayer1);   // may mark the player grounded for this one press
             const bool airborne = !p->m_isOnGround && jw::ringCount(p) == 0;
             jw::logDecision(airborne
                 ? "CUSHIONED: early click held back, the engine sees nothing until it is legal"
@@ -678,10 +802,12 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             jw::beginCushion(w, p);
             st.anyActive = true;
             if (airborne) {
-                w.deferred = true;
+                w.deferred  = true;
+                w.predTicks = jw::predictLanding(jw::g_track[jw::sideIdx(isPlayer1)]);
                 return;                               // NOT passed to GJBaseGameLayer::handleButton
             }
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            if (coyote) jw::finishCoyote(p, isPlayer1);
             return;
         }
 
@@ -710,6 +836,7 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         }
 
         ++jw::g_stepSeq;
+        jw::trackAir(self);                  // motion state for this tick, before any input is processed
         jw::g_inTick = true;
         GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
         jw::g_inTick = false;

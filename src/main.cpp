@@ -16,80 +16,170 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 using namespace geode::prelude;
 
+// ===========================================================================
+// PURE WAVE PREDICTION MATH (no Geode types; unit-tested separately)
+// ===========================================================================
+// BEGIN PURE
+namespace jwmath {
+    struct Box { double minX, maxX, minY, maxY; bool solid; };
+
+    // The wave as seen by the predictor. vx = horizontal distance per physics
+    // step, vy = vertical distance per step while the wave is angled (>= 0).
+    struct WaveState { double x, y, vx, vy, half; };
+
+    struct World {
+        std::vector<Box> boxes;   // sorted by minX
+        double maxW = 0.0;        // widest box, so a minX window query cannot miss a long one
+
+        void clear() { boxes.clear(); maxW = 0.0; }
+
+        void finalize() {
+            std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) { return a.minX < b.minX; });
+            maxW = 0.0;
+            for (auto& b : boxes) maxW = std::max(maxW, b.maxX - b.minX);
+        }
+
+        void gather(double xlo, double xhi, double ylo, double yhi, std::vector<Box>& out) const {
+            out.clear();
+            const double from = xlo - maxW;
+            auto it = std::lower_bound(boxes.begin(), boxes.end(), from,
+                [](const Box& b, double v) { return b.minX < v; });
+            for (; it != boxes.end() && it->minX <= xhi; ++it) {
+                if (it->maxX < xlo) continue;
+                if (it->maxY < ylo || it->minY > yhi) continue;
+                out.push_back(*it);
+            }
+        }
+    };
+
+    struct Hit { int kind = 0; double t = 0.0; }; // kind: 0 none, 1 entered through a side (x), 2 through a top/bottom (y)
+
+    // Segment (x0,y0)->(x1,y1) of the wave's CENTER against a box grown by the
+    // wave's half-size. Objects the wave already overlaps (sliding along them)
+    // are ignored: they cannot be judged from a point sweep.
+    inline Hit sweep(double x0, double y0, double x1, double y1, const Box& b, double half, double eps) {
+        const double minX = b.minX - half + eps, maxX = b.maxX + half - eps;
+        const double minY = b.minY - half + eps, maxY = b.maxY + half - eps;
+        if (minX >= maxX || minY >= maxY) return {};
+        if (x0 > minX && x0 < maxX && y0 > minY && y0 < maxY) return {};
+
+        const double dx = x1 - x0, dy = y1 - y0;
+        const double inf = std::numeric_limits<double>::infinity();
+        auto slab = [&](double p0, double d, double lo, double hi, double& tn, double& tf) {
+            if (std::fabs(d) < 1e-9) {
+                if (p0 <= lo || p0 >= hi) return false;
+                tn = -inf; tf = inf; return true;
+            }
+            double t1 = (lo - p0) / d, t2 = (hi - p0) / d;
+            if (t1 > t2) std::swap(t1, t2);
+            tn = t1; tf = t2; return true;
+        };
+        double txn, txf, tyn, tyf;
+        if (!slab(x0, dx, minX, maxX, txn, txf)) return {};
+        if (!slab(y0, dy, minY, maxY, tyn, tyf)) return {};
+        const double tn = std::max(txn, tyn), tf = std::min(txf, tyf);
+        if (tn > tf || tf < 0.0 || tn > 1.0 || tn < 0.0) return {};
+        return Hit{txn > tyn ? 1 : 2, tn};
+    }
+
+    // Does flying `horizon` steps kill the wave? First `switchAfter` steps use
+    // dir0, the rest dir1 (dir: +1 up, -1 down). Rules, matching the game:
+    //   * hazards (spikes, saws): any contact is fatal
+    //   * solid blocks: entering through a SIDE is fatal; touching a top or
+    //     bottom surface makes the wave slide, so the path is treated as safe
+    //     from there on.
+    inline bool pathFatal(const std::vector<Box>& cands, WaveState s, int dir0, int dir1,
+                          int switchAfter, int horizon, double eps = 0.25) {
+        double x = s.x, y = s.y;
+        for (int i = 0; i < horizon; ++i) {
+            const int dir = i < switchAfter ? dir0 : dir1;
+            const double nx = x + s.vx, ny = y + dir * s.vy;
+            Hit best; const Box* bestBox = nullptr;
+            for (const auto& b : cands) {
+                Hit h = sweep(x, y, nx, ny, b, s.half, eps);
+                if (h.kind != 0 && (bestBox == nullptr || h.t < best.t)) { best = h; bestBox = &b; }
+            }
+            if (bestBox) {
+                if (!bestBox->solid) return true;   // hazard
+                if (best.kind == 1)  return true;   // block side
+                return false;                       // slide: stop judging
+            }
+            x = nx; y = ny;
+        }
+        return false;
+    }
+
+    // Should a direction change be held back this tick?
+    // Yes only if: turning now is fatal, but continuing for k ticks and then
+    // turning (some k <= maxHold) survives. Otherwise waiting cannot help.
+    inline bool shouldHoldFlip(const World& w, const WaveState& s, int curDir, int newDir,
+                               int maxHold, int horizon, std::vector<Box>& scratch) {
+        if (curDir == newDir) return false;
+        const double reachX = (horizon + maxHold) * s.vx + s.half;
+        const double reachY = (horizon + maxHold) * s.vy + s.half;
+        w.gather(s.x - s.half, s.x + reachX, s.y - reachY, s.y + reachY, scratch);
+        if (scratch.empty()) return false;
+        if (!pathFatal(scratch, s, newDir, newDir, 0, horizon)) return false;
+        for (int k = 1; k <= maxHold; ++k) {
+            if (!pathFatal(scratch, s, curDir, newDir, k, horizon)) return true;
+        }
+        return false;
+    }
+}
+// END PURE
+
 namespace jw {
-    // Diagnostics only. No gameplay decision reads the wall clock any more.
+    // Diagnostics only. No gameplay decision reads the wall clock.
     using Clock = std::chrono::steady_clock;
 
     constexpr int    kButtonJump = 1;
-    constexpr double kJumpVel    = 5.0;  // old absolute test, kept for log comparison only
-    constexpr double kRegisterDeltaV = 2.0; // per-step upward velocity change that proves a press took (one step of gravity is ~0.25)
+    constexpr double kJumpVel    = 5.0;      // old absolute test, kept for log comparison only
+    constexpr double kRegisterDeltaV = 2.0;  // per-step velocity change that counts as an orb effect (with orb contact)
 
-    // Sub-tick hold cushion: a cushioned press stays down at least this many physics steps.
+    // Sub-tick hold cushion: a press stays down at least this many physics steps.
     constexpr int    kMinHoldSteps = 3;
 
-    // Ceiling for the "stay on the orb" extension (see runBuffer): 0.5 s of
-    // game time. Only reachable if the player stays inside an orb's overlap,
-    // i.e. a frozen/stuck state; normal overlaps end long before this.
+    // Ceiling for the "stay on the orb" extension: 0.5 s of game time.
     constexpr int    kHardCapSteps = 120;
 
-    // Nominal physics rate. The real rate is measured at runtime (g_tps) and
-    // used to turn the window-ms setting into a tick budget when a click arrives.
-    constexpr double kNominalTps = 240.0;
+    // Physics runs at 240 steps per second; used once per click to turn the
+    // window-ms setting into a STEP budget.
+    constexpr double kStepMs = 1000.0 / 240.0;
 
-    // Wave: every input edge (press or release) must stay live for at least
-    // this many physics ticks. Two edges that arrive in the SAME tick (a fast
-    // tap: press+release, or release+press) would otherwise cancel out and the
-    // wave would never change direction. The second edge is pushed to the
-    // next tick instead, so the tap is preserved.
-    constexpr uint64_t kWaveMinGapSteps = 1;
+    // ---- Wave predictor tuning -------------------------------------------
+    constexpr bool   kWavePredict       = true;  // master switch for the look-ahead
+    constexpr int    kWaveMaxHoldSteps  = 6;     // a flip is never held longer than this (6 steps = 25 ms)
+    constexpr int    kWaveHorizon       = 24;    // steps simulated ahead (~100 ms: assumes you hold the new direction that long)
+    constexpr double kWaveHalf          = 5.0;   // half the wave hitbox, in level units (scaled by the player's scale)
+    constexpr double kHazardShrink      = 0.6;   // hazard bounding boxes are bigger than their real hitbox
+    constexpr int    kTypeSolid         = 0;     // GameObjectType values
+    constexpr int    kTypeHazard        = 2;
 
-    // Predictive layer.
-    constexpr int kPredictHorizon    = 90;  // ticks the landing predictor looks ahead
-    constexpr int kPredictExtraSteps = 8;   // a held-back click may outlive the window by this much if landing is predicted
-    constexpr int kCoyoteMinSteps    = 2;   // late-jump grace after walking off an edge (scaled from window-ms, clamped)
-    constexpr int kCoyoteMaxSteps    = 6;
-
-    // Per-side motion tracker, updated once per tick BEFORE inputs are processed.
-    // All heights are in "up" coordinates (flipped when gravity is flipped).
-    struct Track {
-        bool     wasGround     = false;
-        bool     haveGround    = false;
-        bool     fellOff       = false;  // left the ground without jumping (walked off an edge)
-        bool     usedCoyote    = false;  // the late jump for this fall has been spent
-        bool     upsideKey     = false;
-        int      samples       = 0;
-        int      coyoteSince   = 0;      // ticks since ground when the late jump was granted
-        uint64_t lastGroundSeq = 0;
-        double   groundY       = 0.0;    // up-coordinate of the last ground contact
-        double   Y0 = 0.0, Y1 = 0.0, Y2 = 0.0; // up-coordinate now / one tick ago / two ticks ago
-    };
-
-    // One cushioned press per player side.
     struct Side {
-        bool     active         = false; // a press we are streaming/cushioning is in flight
+        bool     active         = false; // a click is being handled (waiting for contact, or press in flight)
+        bool     pressed        = false; // the press has been delivered to the engine
+        bool     early          = false; // arrived with nothing to land on: buffered until contact
         bool     releaseQueued  = false; // player let go; the release sits in the tick queue
         bool     releaseOk      = false; // gate: the queued release may now be delivered
-        bool     deferred       = false; // click was HELD BACK: the engine has not seen this press yet
         bool     registered     = false; // the engine acted on the press
         bool     pressGround    = false; // diagnostics
         int      pressRings     = 0;     // diagnostics
-        int      predTicks      = -1;    // landing predicted at click time (-1: no prediction)
-        // Snapshot from the previous step, used to detect that the press took.
         bool     prevGround     = false;
         bool     prevUpsideDown = false;
         int      prevRings      = 0;
         double   prevUp         = 0.0;
-        uint64_t pressSeq       = 0;     // step counter when the player clicked
-        uint64_t sentSeq        = 0;     // step counter when the press actually reached the engine
-        int      heldSteps      = 0;     // physics steps the press has been live
-        int      ackSteps       = 0;     // ticks between the press and the engine acting on it
-        int      maxSteps       = 0;     // step budget (stutter-proof, game time)
-        int      streamed       = 0;     // extra presses streamed while waiting
-        int      extSteps       = 0;     // steps spent past the budget because an orb overlap was live
+        uint64_t clickSeq       = 0;     // step counter when the click arrived
+        uint64_t pressSeq       = 0;     // step counter when the press went in
+        int      waitSteps      = 0;     // steps spent waiting for contact
+        int      heldSteps      = 0;     // steps the press has been live
+        int      maxSteps       = 0;     // step budget (game time, stutter-proof)
+        int      streamed       = 0;
+        int      extSteps       = 0;
         Clock::time_point clickTime{};   // diagnostics only
     };
 
@@ -102,10 +192,21 @@ namespace jw {
     // One ordered input timeline, clocked in raw physics ticks.
     struct Event {
         uint64_t dueStep;
+        uint64_t bornStep;
         uint64_t seq;
         bool     down;
         bool     p1;
-        bool     cushion; // release gated by the side's releaseOk
+        bool     cushion;   // release gated by the side's releaseOk (cube)
+        bool     waveGate;  // direction change gated by the wave predictor
+    };
+
+    struct WaveTrack {
+        bool   seen  = false;
+        bool   valid = false;   // vx measured
+        double lastX = 0.0, lastY = 0.0;
+        double vx    = 0.0;
+        double slope = 1.0;     // |dy| / dx while angled
+        int    dir   = -1;      // +1 up, -1 down (measured; events as fallback)
     };
 
     inline State& state() {
@@ -115,27 +216,25 @@ namespace jw {
 
     inline bool g_enabled      = true;
     inline bool g_practiceOnly = false;
-    inline int  g_windowMs     = 80;   // converted to a step budget per click
-    inline int  g_waveDelay    = 0;    // setting is in frames; converted to physics ticks
+    inline int  g_windowMs     = 80;
+    inline int  g_waveDelay    = 0;
     inline bool g_waveGuard    = false;
     inline bool g_stepHookSeen = false;
-    inline bool g_inTick       = false; // true only while the physics-step hook is running the game's input queue
+    inline bool g_inTick       = false;
     inline bool g_waveDown[2]  = {false, false};
     inline int  g_guardLogs    = 0;
-    inline double g_stepsPerFrame = 4.0; // measured, read-only use (wave delay conversion)
-    inline double g_tps = kNominalTps;   // fixed at the nominal rate (a measured value was too noisy to trust)
-    inline int    g_waveEvents = 0, g_waveSpaced = 0; // wave inputs seen / saved from a same-tick collision
+    inline double g_stepsPerFrame = 4.0;
+    inline double g_modUs      = 0.0;
 
-    inline double g_modUs = 0.0; // microseconds this mod spent since the last frame (diagnostic)
     inline std::vector<Event> g_queue;
-    inline uint64_t g_seq      = 0;    // event ordering
-    inline uint64_t g_stepSeq  = 0;    // physics-step counter (the only clock gameplay logic uses)
+    inline uint64_t g_seq      = 0;
+    inline uint64_t g_stepSeq  = 0;
     inline uint64_t g_lastDue[2] = {0, 0};
-    inline uint64_t g_lastDelivered[2] = {0, 0}; // tick of the last input actually delivered, per side
-    inline Track    g_track[2];
-    inline int      g_predN = 0;          // landing predictions that were checked against reality
-    inline long     g_predErrAbs = 0;     // sum of |actual - predicted| ticks
-    inline int      g_coyoteTried = 0, g_coyoteOk = 0;
+
+    inline WaveTrack g_wave[2];
+    inline jwmath::World g_world;
+    inline bool g_worldReady = false;
+    inline std::vector<jwmath::Box> g_scratch;
 
     inline double msBetween(Clock::time_point from, Clock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();
@@ -164,9 +263,9 @@ namespace jw {
         resetSides();
         g_queue.clear();
         refreshLastDue();
-        g_lastDelivered[0] = g_lastDelivered[1] = 0;
-        g_track[0] = g_track[1] = Track{};
         g_waveDown[0] = g_waveDown[1] = false;
+        g_wave[0] = WaveTrack{};
+        g_wave[1] = WaveTrack{};
     }
 
     inline bool assistActive() {
@@ -177,7 +276,6 @@ namespace jw {
     }
 
     // One-off-action modes: cube, ball, robot, spider.
-    // Ship, UFO, wave and swing never get a cushion.
     inline bool isCubeLike(PlayerObject* p) {
         return p && !(p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing);
     }
@@ -186,92 +284,16 @@ namespace jw {
         return (p && p->m_touchingRings) ? static_cast<int>(p->m_touchingRings->count()) : 0;
     }
 
+    // First tick of ground or orb contact.
+    inline bool hasContact(PlayerObject* p) {
+        return p && (p->m_isOnGround || ringCount(p) > 0);
+    }
+
     inline double upVel(PlayerObject* p) {
         const double vel = static_cast<double>(p->m_yVelocity);
         return p->m_isUpsideDown ? -vel : vel;
     }
 
-    // ---- Predictive layer -------------------------------------------------
-    // Called once per tick before the engine processes queued inputs.
-    inline void trackAir(GJBaseGameLayer* layer) {
-        for (int i = 0; i < 2; ++i) {
-            PlayerObject* p = (i == 0) ? layer->m_player1 : layer->m_player2;
-            Track& t = g_track[i];
-            if (!p || !isCubeLike(p)) { t = Track{}; continue; }
-
-            if (t.samples > 0 && p->m_isUpsideDown != t.upsideKey) t.samples = 0;   // gravity flip breaks the trajectory
-            t.upsideKey = p->m_isUpsideDown;
-
-            const double Y = (p->m_isUpsideDown ? -1.0 : 1.0) * static_cast<double>(p->getPositionY());
-            t.Y2 = t.Y1; t.Y1 = t.Y0; t.Y0 = Y;
-            if (t.samples < 3) ++t.samples;
-
-            if (p->m_isOnGround) {
-                t.lastGroundSeq = g_stepSeq;
-                t.groundY       = Y;
-                t.haveGround    = true;
-                t.fellOff       = false;
-                t.usedCoyote    = false;
-            } else if (t.wasGround) {
-                t.fellOff = upVel(p) <= 0.0;   // left the ground NOT rising = walked off an edge
-            }
-            t.wasGround = p->m_isOnGround;
-        }
-    }
-
-    // Kinematic landing predictor. Learns the per-tick acceleration from the last
-    // three positions (so it needs no hardcoded gravity, speed or size) and rolls
-    // the arc forward until it returns to the last ground height. Returns the
-    // number of ticks until landing, or -1 when it cannot say (no ground height
-    // known, not under gravity, or the arc does not come back inside the horizon).
-    // It assumes landing at the same height; platforms at other heights make it
-    // wrong, which is why it only ever EXTENDS a window by a bounded amount.
-    inline int predictLanding(const Track& t) {
-        if (!t.haveGround || t.samples < 3) return -1;
-        double dy = t.Y0 - t.Y1;
-        const double a = dy - (t.Y1 - t.Y2);
-        if (a > -0.01) return -1;
-        double Y = t.Y0;
-        for (int n = 1; n <= kPredictHorizon; ++n) {
-            dy += a;
-            Y  += dy;
-            if (Y <= t.groundY) return n;
-        }
-        return -1;
-    }
-
-    // Late-jump grace ("coyote time"): a click that arrives a few ticks after the
-    // player walked off an edge (without jumping) is treated as if it were still
-    // on the ground. Marks the player grounded for this one press; finishCoyote()
-    // checks whether the engine really jumped and undoes the flag if not.
-    inline bool tryCoyote(PlayerObject* p, bool p1) {
-        if (g_windowMs <= 0 || p->m_isOnGround || ringCount(p) > 0) return false;
-        Track& t = g_track[sideIdx(p1)];
-        if (!t.haveGround || !t.fellOff || t.usedCoyote) return false;
-        const int windowSteps = static_cast<int>(std::lround(static_cast<double>(g_windowMs) * g_tps / 1000.0));
-        const int coyoteSteps = std::clamp(windowSteps / 4, kCoyoteMinSteps, kCoyoteMaxSteps);
-        const uint64_t since  = g_stepSeq - t.lastGroundSeq;
-        if (since > static_cast<uint64_t>(coyoteSteps)) return false;
-        t.usedCoyote  = true;
-        t.coyoteSince = static_cast<int>(since);
-        ++g_coyoteTried;
-        p->m_isOnGround = true;
-        return true;
-    }
-
-    inline void finishCoyote(PlayerObject* p, bool p1) {
-        const bool jumped = !p->m_isOnGround || upVel(p) > kRegisterDeltaV;
-        if (jumped) ++g_coyoteOk;
-        else        p->m_isOnGround = false;      // the engine did not jump here: undo the flag
-        static int logs = 0;
-        if (logs < 200) {
-            ++logs;
-            log::info("JW: COYOTE late jump ({} ticks after leaving the ground): engine jumped inside handleButton: {} [{} of {} so far]",
-                g_track[sideIdx(p1)].coyoteSince, jumped ? "YES" : "NO (flag undone)", g_coyoteOk, g_coyoteTried);
-        }
-    }
-
-    // Used for logging only: does the player's state look like a jump just fired?
     inline bool jumpFired(PlayerObject* p, bool wasGround) {
         return (wasGround && !p->m_isOnGround) || upVel(p) > kJumpVel;
     }
@@ -288,20 +310,19 @@ namespace jw {
         static int n = 0;
         if (w.active && n < 100) {
             ++n;
-            log::info("JW: previous cushion replaced by a new click (release queued={})", w.releaseQueued);
+            log::info("JW: previous click replaced by a new click (pressed={}, release queued={})", w.pressed, w.releaseQueued);
         }
     }
 
-    // Diagnostic: which path did a real click take?
     inline int g_cntTotal = 0, g_cntCushioned = 0, g_cntUnsupported = 0, g_cntInactive = 0;
     inline void logDecision(const char* why, PlayerObject* p) {
-        const bool cushioned = std::strncmp(why, "CUSHIONED", 9) == 0;
+        const bool cushioned = std::strncmp(why, "CUSHIONED", 9) == 0 || std::strncmp(why, "HELD", 4) == 0;
         if (cushioned)                              ++g_cntCushioned;
         else if (std::strstr(why, "not supported")) ++g_cntUnsupported;
         else                                        ++g_cntInactive;
         ++g_cntTotal;
         if (g_cntTotal % 25 == 0) {
-            log::info("JW: summary after {} clicks: cushioned={} unsupported-mode={} inactive={}",
+            log::info("JW: summary after {} clicks: buffered-or-cushioned={} unsupported-mode={} inactive={}",
                 g_cntTotal, g_cntCushioned, g_cntUnsupported, g_cntInactive);
         }
 
@@ -324,10 +345,93 @@ namespace jw {
     }
 
     // ---------------------------------------------------------------------
+    // Level geometry for the wave predictor (built ONCE at level load)
+    // ---------------------------------------------------------------------
+
+    // Reads one object. The `requires` check makes this degrade gracefully:
+    // if the bindings in use lack these members, it returns false (predictor
+    // stays off) instead of breaking the build.
+    template <class Obj>
+    inline bool readBox(Obj* o, jwmath::Box& b) {
+        if constexpr (requires { o->m_objectType; o->getObjectRect(); }) {
+            if (!o) return false;
+            const int t = static_cast<int>(o->m_objectType);
+            if (t != kTypeSolid && t != kTypeHazard) return false;
+            const auto r = o->getObjectRect();
+            b.minX = r.origin.x;               b.maxX = r.origin.x + r.size.width;
+            b.minY = r.origin.y;               b.maxY = r.origin.y + r.size.height;
+            b.solid = (t == kTypeSolid);
+            if (!b.solid) { // real spike hitboxes are smaller than their bounding box
+                const double cx = (b.minX + b.maxX) * 0.5, cy = (b.minY + b.maxY) * 0.5;
+                const double hw = (b.maxX - b.minX) * 0.5 * kHazardShrink;
+                const double hh = (b.maxY - b.minY) * 0.5 * kHazardShrink;
+                b.minX = cx - hw; b.maxX = cx + hw; b.minY = cy - hh; b.maxY = cy + hh;
+            }
+            return b.maxX > b.minX && b.maxY > b.minY;
+        } else {
+            return false;
+        }
+    }
+
+    template <class Layer>
+    inline void buildWorldFrom(Layer* layer) {
+        g_world.clear();
+        g_worldReady = false;
+        if constexpr (requires { layer->m_objects; }) {
+            auto* arr = layer->m_objects;
+            if (!arr) { log::info("JW: wave predictor off (no object array)"); return; }
+            const auto t0 = Clock::now();
+            const unsigned n = static_cast<unsigned>(arr->count());
+            g_world.boxes.reserve(n / 2);
+            for (unsigned i = 0; i < n; ++i) {
+                jwmath::Box b{};
+                if (readBox(static_cast<GameObject*>(arr->objectAtIndex(i)), b)) g_world.boxes.push_back(b);
+            }
+            g_world.finalize();
+            g_worldReady = !g_world.boxes.empty();
+            log::info("JW: wave predictor world built: {} blocks/hazards from {} objects in {:.1f} ms (ready: {})",
+                g_world.boxes.size(), n, msBetween(t0, Clock::now()), g_worldReady);
+        } else {
+            log::info("JW: wave predictor off (bindings have no m_objects)");
+        }
+    }
+
+    // Measure the wave once per physics tick: speed, slope, direction.
+    inline void trackWave(GJBaseGameLayer* layer) {
+        for (int i = 0; i < 2; ++i) {
+            PlayerObject* p = (i == 0) ? layer->m_player1 : layer->m_player2;
+            auto& t = g_wave[i];
+            if (!p || !p->m_isDart) { t = WaveTrack{}; continue; }
+            const double x = static_cast<double>(p->getPositionX());
+            const double y = static_cast<double>(p->getPositionY());
+            if (t.seen) {
+                const double dx = x - t.lastX, dy = y - t.lastY;
+                if (dx > 0.05 && dx < 50.0) {
+                    t.vx = dx;
+                    t.valid = true;
+                    if (std::fabs(dy) > 0.05) {
+                        t.slope = std::clamp(0.8 * t.slope + 0.2 * (std::fabs(dy) / dx), 0.25, 4.0);
+                        t.dir = dy > 0.0 ? 1 : -1;
+                    }
+                }
+            }
+            t.seen = true;
+            t.lastX = x;
+            t.lastY = y;
+        }
+    }
+
+    inline int waveDirFor(bool down, bool upsideDown) {
+        return (down ? 1 : -1) * (upsideDown ? -1 : 1);
+    }
+
+    // May this direction change go out on this tick?
+    inline bool waveMayDeliver(GJBaseGameLayer* layer, const struct Event& ev);
+
+    // ---------------------------------------------------------------------
     // The physics-tick input queue
     // ---------------------------------------------------------------------
 
-    // Send one virtual jump input to the game, bypassing our own intercept.
     inline void inject(GJBaseGameLayer* layer, bool down, bool p1) {
         auto& st = state();
         const bool was = st.injecting;
@@ -336,32 +440,42 @@ namespace jw {
         st.injecting = was;
     }
 
-    // Queue an input for a physics tick. Per side, due ticks never go
-    // backwards, so presses and releases can never swap places.
-    // minGap > 0: this input must be at least minGap ticks after the previous
-    // input of the same side (queued or already delivered). Returns true when
-    // that pushed it later than it would otherwise have been.
-    inline bool enqueue(bool down, bool p1, uint64_t dueStep, bool cushion, uint64_t minGap = 0) {
+    inline void enqueue(bool down, bool p1, uint64_t dueStep, bool cushion, bool waveGate = false) {
         const int i = sideIdx(p1);
         if (dueStep < g_lastDue[i]) dueStep = g_lastDue[i];
-        bool spaced = false;
-        if (minGap > 0) {
-            const uint64_t earliest = std::max(g_lastDue[i], g_lastDelivered[i]) + minGap;
-            if (dueStep < earliest) { dueStep = earliest; spaced = true; }
-        }
         g_lastDue[i] = dueStep;
-        g_queue.push_back(Event{dueStep, ++g_seq, down, p1, cushion});
-        return spaced;
+        g_queue.push_back(Event{dueStep, g_stepSeq, ++g_seq, down, p1, cushion, waveGate});
     }
 
-    // Wave delay is configured in frames; the queue counts physics ticks.
     inline uint64_t waveDelaySteps() {
         if (g_waveDelay <= 0) return 0;
         const long steps = std::lround(static_cast<double>(g_waveDelay) * g_stepsPerFrame);
         return static_cast<uint64_t>(std::max<long>(steps, g_waveDelay));
     }
 
-    inline void recordOutcome(const Side& w);
+    // ---------------------------------------------------------------------
+    // Outcome statistics (the per-click logs are capped; these are not)
+    // ---------------------------------------------------------------------
+    inline int g_outGroundAck = 0, g_outGroundMiss = 0;   // contact existed at click time
+    inline int g_outEarlyAck = 0,  g_outEarlyMiss = 0;    // buffered until contact
+    inline long g_earlyWaitSum = 0;
+    inline int  g_earlyWaitMax = 0;
+
+    inline void recordOutcome(const Side& w) {
+        if (w.early) {
+            if (w.registered) { ++g_outEarlyAck; g_earlyWaitSum += w.waitSteps; g_earlyWaitMax = std::max(g_earlyWaitMax, w.waitSteps); }
+            else              { ++g_outEarlyMiss; }
+        } else {
+            if (w.registered) ++g_outGroundAck; else ++g_outGroundMiss;
+        }
+        const int total = g_outGroundAck + g_outGroundMiss + g_outEarlyAck + g_outEarlyMiss;
+        if (total % 10 == 0) {
+            log::info("JW: outcomes after {}: contact-at-click ack={} miss={} | buffered ack={} miss={} (waited avg {:.1f} / max {} steps, budget {} steps)",
+                total, g_outGroundAck, g_outGroundMiss, g_outEarlyAck, g_outEarlyMiss,
+                g_outEarlyAck > 0 ? static_cast<double>(g_earlyWaitSum) / g_outEarlyAck : 0.0,
+                g_earlyWaitMax, w.maxSteps);
+        }
+    }
 
     inline void deliver(GJBaseGameLayer* layer, const Event& ev) {
         auto& st = state();
@@ -374,21 +488,54 @@ namespace jw {
                 static int relLogs = 0;
                 if (relLogs < 300) {
                     ++relLogs;
-                    log::info("JW: cushion release via {} (held {}/{} ticks, acked after {} ticks, streamed {} extra presses, {} ticks past budget on an orb, registered: {}, pressed on ground={} rings={}, now ground={} rings={})",
-                        w.registered ? "engine ack" : "budget end (jump never became legal)", w.heldSteps, w.maxSteps, w.ackSteps,
-                        w.streamed, w.extSteps, w.registered, w.pressGround, w.pressRings,
-                        p ? p->m_isOnGround : false, ringCount(p));
+                    log::info("JW: cushion release via {} (waited {} steps for contact, held {}/{} steps, streamed {} extra presses, {} steps past budget on an orb, registered: {}, diag wall {:.1f} ms, pressed on ground={} rings={}, now ground={} rings={}, old test: {})",
+                        w.registered ? "engine ack" : "step budget end", w.waitSteps, w.heldSteps, w.maxSteps,
+                        w.streamed, w.extSteps, w.registered, msBetween(w.clickTime, Clock::now()),
+                        w.pressGround, w.pressRings,
+                        p ? p->m_isOnGround : false, ringCount(p),
+                        p ? jumpFired(p, w.pressGround) : false);
                 }
             }
             st.sides[i] = Side{};
             st.anyActive = st.sides[0].active || st.sides[1].active;
         }
-        g_lastDelivered[sideIdx(ev.p1)] = g_stepSeq;
+        if (ev.waveGate) {
+            PlayerObject* p = ev.p1 ? layer->m_player1 : layer->m_player2;
+            g_wave[i].dir = waveDirFor(ev.down, p ? p->m_isUpsideDown : false);
+            const uint64_t held = g_stepSeq - ev.bornStep;
+            static int heldLogs = 0;
+            if (held > 0 && heldLogs < 300) {
+                ++heldLogs;
+                log::info("JW: wave {} delivered after being held {} ticks for a safe turn",
+                    ev.down ? "press" : "release", held);
+            }
+        }
         inject(layer, ev.down, ev.p1);
     }
 
-    // Deliver what is due on this physics tick, in order. force: deliver
-    // everything now. onlySide >= 0: touch only that side's events.
+    inline bool waveMayDeliver(GJBaseGameLayer* layer, const Event& ev) {
+        if (!kWavePredict || !g_worldReady) return true;
+        if (g_stepSeq - ev.bornStep >= static_cast<uint64_t>(kWaveMaxHoldSteps)) return true; // never eat an input
+
+        const int i = sideIdx(ev.p1);
+        PlayerObject* p = ev.p1 ? layer->m_player1 : layer->m_player2;
+        const auto& t = g_wave[i];
+        if (!p || !p->m_isDart || !t.valid) return true;
+        if (p->m_isUpsideDown) return true; // direction mapping unverified when flipped: stay out of the way
+
+        const double scale = std::clamp(static_cast<double>(p->getScale()), 0.3, 1.5);
+        jwmath::WaveState s;
+        s.x = t.lastX; s.y = t.lastY;
+        s.vx = t.vx;   s.vy = t.vx * t.slope;
+        s.half = kWaveHalf * scale;
+
+        const int curDir = t.dir;
+        const int newDir = waveDirFor(ev.down, p->m_isUpsideDown);
+        const bool hold = jwmath::shouldHoldFlip(g_world, s, curDir, newDir,
+                                                 kWaveMaxHoldSteps, kWaveHorizon, g_scratch);
+        return !hold;
+    }
+
     inline void drain(GJBaseGameLayer* layer, bool force, int onlySide = -1) {
         if (g_queue.empty() || !layer) return;
         auto& st = state();
@@ -408,7 +555,10 @@ namespace jw {
             bool ready = force || (!blocked[i] && ev.dueStep <= g_stepSeq);
             if (ready && !force && ev.cushion) {
                 const auto& w = st.sides[i];
-                if (w.active && !w.releaseOk) ready = false; // engine has not acknowledged yet
+                if (w.active && !w.releaseOk) ready = false;     // engine has not acknowledged yet
+            }
+            if (ready && !force && ev.waveGate) {
+                if (!waveMayDeliver(layer, ev)) ready = false;   // unsafe to turn on this tick
             }
             if (!ready) { blocked[i] = true; keep.push_back(ev); continue; }
             deliver(layer, ev);
@@ -422,33 +572,8 @@ namespace jw {
     inline void flushSide(GJBaseGameLayer* layer, bool p1) { drain(layer, true, sideIdx(p1)); }
     inline void flushAll(GJBaseGameLayer* layer)           { drain(layer, true); }
 
-    // Forget every queued input of one side (used for clicks the engine never saw).
-    inline void dropSide(bool p1) {
-        const int i = sideIdx(p1);
-        g_queue.erase(std::remove_if(g_queue.begin(), g_queue.end(),
-                          [i](const Event& e) { return sideIdx(e.p1) == i; }),
-                      g_queue.end());
-        refreshLastDue();
-    }
-
-    // A held-back press whose key is still physically down must not be lost
-    // when we stop managing it: hand it to the engine now.
-    inline void sendHeldBack(GJBaseGameLayer* layer) {
-        auto& st = state();
-        for (int i = 0; i < 2; ++i) {
-            auto& w = st.sides[i];
-            if (w.active && w.deferred && !w.releaseQueued) inject(layer, true, i == 0);
-        }
-    }
-
-    inline void beginCushion(Side& w, PlayerObject* p) {
-        w = Side{};
-        w.active         = true;
-        w.clickTime      = Clock::now();   // diagnostics only
+    inline void snapshotForPress(Side& w, PlayerObject* p) {
         w.pressSeq       = g_stepSeq;
-        w.sentSeq        = g_stepSeq;      // overwritten later if the click is held back
-        w.maxSteps       = std::max(kMinHoldSteps,
-                               static_cast<int>(std::lround(static_cast<double>(g_windowMs) * g_tps / 1000.0)));
         w.pressGround    = p->m_isOnGround;
         w.pressRings     = ringCount(p);
         w.prevGround     = p->m_isOnGround;
@@ -458,50 +583,18 @@ namespace jw {
     }
 
     // ---------------------------------------------------------------------
-    // Outcome statistics (the per-click logs are capped; these are not)
-    // ---------------------------------------------------------------------
-    inline int g_outGroundAck = 0, g_outGroundMiss = 0;   // pressed on ground / on an orb
-    inline int g_outAirAck = 0,    g_outAirMiss = 0;      // pressed in the air with nothing in reach
-    inline long g_airAckStepsSum = 0;
-    inline int  g_airAckStepsMax = 0;
-    inline int  g_savedClicks = 0;  // early taps the buffer carried to a legal tick
-    inline long g_savedTicks  = 0;  // total ticks those taps were carried for
-
-    inline void recordOutcome(const Side& w) {
-        const bool air = !w.pressGround && w.pressRings == 0;
-        if (air) {
-            if (w.registered) { ++g_outAirAck; g_airAckStepsSum += w.ackSteps; g_airAckStepsMax = std::max(g_airAckStepsMax, w.ackSteps); }
-            else              { ++g_outAirMiss; }
-        } else {
-            if (w.registered) ++g_outGroundAck; else ++g_outGroundMiss;
-        }
-        const int total = g_outGroundAck + g_outGroundMiss + g_outAirAck + g_outAirMiss;
-        if (total % 10 == 0) {
-            log::info("JW: outcomes after {}: ground/orb ack={} miss={} | early-air ack={} miss={} (ack after avg {:.1f} / max {} ticks, budget {} ticks, {} ticks saved in total) | predictor: {} checked, mean error {:.1f} ticks | coyote: {}/{} jumped",
-                total, g_outGroundAck, g_outGroundMiss, g_outAirAck, g_outAirMiss,
-                g_outAirAck > 0 ? static_cast<double>(g_airAckStepsSum) / g_outAirAck : 0.0,
-                g_airAckStepsMax, w.maxSteps, g_savedTicks,
-                g_predN, g_predN > 0 ? static_cast<double>(g_predErrAbs) / g_predN : 0.0,
-                g_coyoteOk, g_coyoteTried);
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Per-step supervision: stream the press until the engine acknowledges it
+    // Per-step supervision (cube-like modes)
     // ---------------------------------------------------------------------
     //
-    // Every physics step the press is sent again (handleButton(true)) until
-    // the engine shows the press took: left the ground, gravity flipped, or an
-    // upward velocity jump far larger than one step of gravity.
+    // A click with nothing to land on is HELD BACK (the engine never sees it).
+    // On the first tick of ground or orb contact the press is injected, then
+    // re-sent every step until the engine acknowledges it (left the ground,
+    // gravity flip, or an orb-contact velocity change). A jump fires INSIDE
+    // handleButton, so the comparison snapshot is taken before the press and
+    // only rolled forward after the check has run.
     //
-    // IMPORTANT: a jump or orb fires INSIDE handleButton, so the comparison
-    // snapshot must stay at its pre-press value until the check has run, and
-    // the check runs again right after every streamed press. (Build 11
-    // refreshed the snapshot too early and never saw a single ground jump.)
-    //
-    // Budget: normally the step budget derived from window-ms. If the player
-    // is overlapping an orb (m_touchingRings) and the press is still
-    // unacknowledged, the budget is ignored and the stream keeps going until
+    // Budget: step counts only (stutter-proof). If the player overlaps an
+    // orb and the press is still unacknowledged, the budget is ignored until
     // the engine acknowledges or the overlap ends (kHardCapSteps as a rail).
     inline void runBuffer(GJBaseGameLayer* layer) {
         auto& st = state();
@@ -514,134 +607,85 @@ namespace jw {
             const bool p1 = (i == 0);
             PlayerObject* p = p1 ? layer->m_player1 : layer->m_player2;
 
-            // Player gone or no longer in a supported mode: stop managing it.
-            // A held-back press whose key is still down goes to the engine now;
-            // a held-back tap that was already released is simply forgotten.
+            // Player gone or no longer in a supported mode: stop; a queued release goes out this step.
             if (!p || !isCubeLike(p)) {
-                if (w.deferred) {
-                    if (w.releaseQueued) dropSide(p1);
-                    else if (p)          inject(layer, true, p1);
-                }
                 w = Side{};
                 continue;
             }
 
-            const int age = static_cast<int>(g_stepSeq - w.pressSeq);   // ticks since the player clicked
-            w.heldSteps = age;
-
-            auto snapshot = [&]() {
-                w.prevGround     = p->m_isOnGround;
-                w.prevUpsideDown = p->m_isUpsideDown;
-                w.prevRings      = ringCount(p);
-                w.prevUp         = upVel(p);
-            };
-
-            // ---- Held-back click: the engine has NOT seen it. Deliver it on the
-            // first tick where it is legal (landed, or touching an orb).
-            if (w.deferred) {
-                if (p->m_isOnGround || ringCount(p) > 0) {
-                    snapshot();                       // judge the press against the state right before it
-                    w.deferred = false;
-                    w.sentSeq  = g_stepSeq;
-                    if (w.predTicks >= 0 && p->m_isOnGround) {          // check the predictor against reality
-                        ++g_predN;
-                        g_predErrAbs += std::abs(age - w.predTicks);
+            // ---- waiting for the first tick of contact -------------------
+            if (!w.pressed) {
+                w.waitSteps = static_cast<int>(g_stepSeq - w.clickSeq);
+                if (hasContact(p)) {
+                    snapshotForPress(w, p);          // pre-press state
+                    w.pressed = true;
+                    inject(layer, true, p1);         // the buffered 'down' goes in on the contact tick
+                    static int contactLogs = 0;
+                    if (contactLogs < 200) {
+                        ++contactLogs;
+                        log::info("JW: buffered click injected on contact tick after {} steps (ground={} rings={})",
+                            w.waitSteps, w.pressGround, w.pressRings);
                     }
-                    static int sendLogs = 0;
-                    if (sendLogs < 300) {
-                        ++sendLogs;
-                        log::info("JW: held-back click delivered to the engine {} ticks after the click ({}; predicted landing in {} ticks)",
-                            age, p->m_isOnGround ? "landed" : "orb contact", w.predTicks);
-                    }
-                    inject(layer, true, p1);
-                } else if (const int pred = predictLanding(g_track[i]);
-                           age >= w.maxSteps && pred >= 0 && age + pred <= w.maxSteps + kPredictExtraSteps) {
-                    // Past the window, but the predictor says landing is imminent: keep holding.
-                    static int extLogs = 0;
-                    if (age == w.maxSteps && extLogs < 100) {
-                        ++extLogs;
-                        log::info("JW: window over at {} ticks, predictor says landing in {} more: still holding", age, pred);
-                    }
-                    snapshot();
-                    continue;
-                } else if (age >= w.maxSteps) {
-                    // Too early: no legal moment inside the window.
+                } else if (w.waitSteps >= w.maxSteps) {
+                    // No contact within the budget: this click never had a landing.
                     recordOutcome(w);
-                    static int expLogs = 0;
-                    if (expLogs < 300) {
-                        ++expLogs;
-                        log::info("JW: held-back click expired after {} ticks with no legal moment ({})",
-                            age, w.releaseQueued ? "already released: dropped" : "key still down: forwarded to the engine");
+                    if (!w.releaseQueued) {
+                        inject(layer, true, p1);     // player is still holding: hand the hold back
+                        log::info("JW: buffered click expired after {} steps without contact; hold handed back", w.waitSteps);
+                    } else {
+                        log::info("JW: buffered tap expired after {} steps without contact; dropped", w.waitSteps);
                     }
-                    if (w.releaseQueued) dropSide(p1);
-                    else                 inject(layer, true, p1);
                     w = Side{};
                     continue;
                 } else {
-                    snapshot();                       // keep waiting, engine sees nothing
                     continue;
                 }
             }
 
-            const int live = static_cast<int>(g_stepSeq - w.sentSeq);   // ticks since the engine got the press
+            // ---- press is live: stream until acknowledged ----------------
+            w.heldSteps = static_cast<int>(g_stepSeq - w.pressSeq);
 
-            // Did the press take, judged against the snapshot? Landing is
-            // excluded (ground contact zeroes velocity, which is not a jump).
             auto detect = [&]() {
                 if (w.registered) return;
-                const bool   onGround = p->m_isOnGround;
-                const bool   left     = w.prevGround && !onGround;
-                const bool   flipped  = p->m_isUpsideDown != w.prevUpsideDown;
+                const bool   onGround   = p->m_isOnGround;
+                const bool   left       = w.prevGround && !onGround;
+                const bool   flipped    = p->m_isUpsideDown != w.prevUpsideDown;
                 // A velocity change alone is NOT proof (pads, portals, slopes also
-                // change it). It only counts together with real orb contact,
-                // now or at the previous step; gravity orbs show up as `flipped`.
+                // change it); it only counts together with real orb contact.
                 const bool   orbContact = ringCount(p) > 0 || w.prevRings > 0;
-                const bool   kick     = !onGround && orbContact
-                                        && std::fabs(upVel(p) - w.prevUp) > kRegisterDeltaV;
-                if (left || flipped || kick) {
-                    w.registered = true;
-                    w.ackSteps = static_cast<int>(g_stepSeq - w.pressSeq);
-                    if (!w.pressGround && w.pressRings == 0) {   // an early tap: this is a saved click
-                        ++g_savedClicks;
-                        g_savedTicks += w.ackSteps;
-                        static int savedLogs = 0;
-                        if (savedLogs < 300) {
-                            ++savedLogs;
-                            log::info("JW: SAVED early click #{}: jump fired {} ticks ({:.1f} ms at {:.0f} TPS) after the click",
-                                g_savedClicks, w.ackSteps, w.ackSteps * 1000.0 / g_tps, g_tps);
-                        }
-                    }
-                }
+                const bool   kick       = !onGround && orbContact
+                                          && std::fabs(upVel(p) - w.prevUp) > kRegisterDeltaV;
+                if (left || flipped || kick) w.registered = true;
             };
 
-            detect();   // catches a press that took inside handleButton / the previous streamed press
+            detect();
 
-            const bool overBudget = age >= w.maxSteps && live >= kMinHoldSteps;
+            const bool overBudget = w.heldSteps >= w.maxSteps;
             const bool nearOrb    = ringCount(p) > 0;
-            const bool extend     = !w.registered && overBudget && nearOrb && age < kHardCapSteps;
+            const bool extend     = !w.registered && overBudget && nearOrb && w.heldSteps < kHardCapSteps;
 
-            // Continuous streaming: one more press on every tick until acknowledged.
-            if (!w.registered && live >= 1 && (!overBudget || extend)) {
+            if (!w.registered && w.heldSteps >= 1 && (!overBudget || extend)) {
                 inject(layer, true, p1);
                 ++w.streamed;
                 if (overBudget) ++w.extSteps;
-                detect();   // the streamed press may itself have fired the jump
+                detect();
             }
 
-            // Only now roll the snapshot forward, for the next step's comparison.
-            snapshot();
+            w.prevGround     = p->m_isOnGround;
+            w.prevUpsideDown = p->m_isUpsideDown;
+            w.prevRings      = ringCount(p);
+            w.prevUp         = upVel(p);
 
-            w.releaseOk = (w.registered && live >= kMinHoldSteps)
+            w.releaseOk = (w.registered && w.heldSteps >= kMinHoldSteps)
                        || (overBudget && !extend);
 
-            // Player is still holding and we are done: nothing to release, stop tracking.
             if (!w.releaseQueued && w.releaseOk) {
                 recordOutcome(w);
                 static int doneLogs = 0;
                 if (doneLogs < 400) {
                     ++doneLogs;
-                    log::info("JW: press tracking ended while held (registered: {}, age {}/{} ticks, streamed {}, extended {})",
-                        w.registered, age, w.maxSteps, w.streamed, w.extSteps);
+                    log::info("JW: press tracking ended while held (registered: {}, waited {} steps, held {}/{} steps, streamed {}, extended {})",
+                        w.registered, w.waitSteps, w.heldSteps, w.maxSteps, w.streamed, w.extSteps);
                 }
                 w = Side{};
             }
@@ -650,8 +694,7 @@ namespace jw {
         st.anyActive = st.sides[0].active || st.sides[1].active;
     }
 
-    // Runs once per rendered frame. Diagnostics and UI only: it delivers no
-    // input and drives no gameplay logic.
+    // Runs once per rendered frame. Diagnostics and UI only.
     inline void tick() {
         const auto tickStart = Clock::now();
         static auto lastFrame = Clock::now();
@@ -660,7 +703,6 @@ namespace jw {
         const double frameMs = msBetween(lastFrame, nowFrame);
         lastFrame = nowFrame;
 
-        // Measure physics ticks per rendered frame (read-only; converts wave-delay frames to ticks).
         const uint64_t steps = g_stepSeq - lastSeq;
         lastSeq = g_stepSeq;
         if (steps > 0 && steps <= 64) {
@@ -686,7 +728,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 16 loaded (held-back early clicks, landing predictor, coyote late jump, same-tick wave tap preservation, macOS)");
+    log::info("JW: build 14 loaded (contact-tick cube buffer, predictive wave turn buffer, tick-locked queue, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -716,7 +758,6 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto& st = jw::state();
 
-        // Diagnostic: how old is this physical click when the game receives it?
         static int diagLogs = 0;
         if (down && !st.injecting && button == jw::kButtonJump && diagLogs < 40) {
             ++diagLogs;
@@ -734,7 +775,6 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                                       : "PASS: assist inactive (Enabled is off)",
                         isPlayer1 ? m_player1 : m_player2);
                 }
-                // Anything still queued for this side goes out first, in order.
                 jw::flushSide(self, isPlayer1);
             }
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
@@ -748,12 +788,11 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         auto& w = st.sides[isPlayer1 ? 0 : 1];
         const int side = isPlayer1 ? 0 : 1;
 
-        // Wave: presses and releases ride the physics-tick queue. With delay 0
-        // they are delivered inside this very tick; otherwise on the tick
-        // they fall due. The frame handler never touches them.
+        // ---- Wave: every direction change rides the tick queue and is gated
+        // by the predictor (delivered at once when safe, held up to
+        // kWaveMaxHoldSteps ticks when turning right now would crash).
         if (p && p->m_isDart) {
             if (jw::g_waveGuard) {
-                // Drop a repeated press with no release in between. Releases always pass.
                 if (down && jw::g_waveDown[side]) {
                     if (jw::g_guardLogs < 20) {
                         ++jw::g_guardLogs;
@@ -763,23 +802,24 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 }
                 jw::g_waveDown[side] = down;
             }
-            if (w.active) w = jw::Side{};     // left cube-like mode with a cushion pending
-            const bool spaced = jw::enqueue(down, isPlayer1, jw::g_stepSeq + jw::waveDelaySteps(), false, jw::kWaveMinGapSteps);
-            ++jw::g_waveEvents;
-            if (spaced) {
-                ++jw::g_waveSpaced;
-                if (jw::g_waveSpaced <= 60 || jw::g_waveSpaced % 25 == 0) {
-                    log::info("JW: wave {} arrived in the same tick as the previous wave input -> pushed one tick later so the tap is not swallowed (saved {} of {} wave inputs)",
-                        down ? "press" : "release", jw::g_waveSpaced, jw::g_waveEvents);
-                }
+            if (w.active) w = jw::Side{};
+
+            static int waveLogs = 0;
+            if (waveLogs < 300) {
+                ++waveLogs;
+                log::info("JW: wave {} at step {} x={:.1f} y={:.1f} yVel={:.2f} (earliest delivery step {})",
+                    down ? "press" : "release", jw::g_stepSeq,
+                    static_cast<double>(p->getPositionX()), static_cast<double>(p->getPositionY()),
+                    static_cast<double>(p->m_yVelocity), jw::g_stepSeq + jw::waveDelaySteps());
             }
+
+            jw::enqueue(down, isPlayer1, jw::g_stepSeq + jw::waveDelaySteps(), false, true);
             if (jw::g_inTick) jw::pump(self);
             return;
         }
-        jw::g_waveDown[side] = false; // not in wave: nothing to track
+        jw::g_waveDown[side] = false;
 
         if (down) {
-            // Window of 0 or unsupported mode: vanilla behavior.
             if (jw::g_windowMs <= 0 || !jw::isCubeLike(p)) {
                 jw::logDecision("PASS: window is 0 or mode not supported", p);
                 jw::flushSide(self, isPlayer1);
@@ -788,45 +828,46 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 return;
             }
 
-            // Airborne with nothing to grab: the click is HELD BACK. The engine
-            // never sees it now; runBuffer delivers it on the first tick where
-            // it is legal (landed, or touching an orb).
-            const bool coyote   = jw::tryCoyote(p, isPlayer1);   // may mark the player grounded for this one press
-            const bool airborne = !p->m_isOnGround && jw::ringCount(p) == 0;
-            jw::logDecision(airborne
-                ? "CUSHIONED: early click held back, the engine sees nothing until it is legal"
-                : "CUSHIONED: press forwarded at once, streamed until the engine acknowledges", p);
             jw::logReplaced(w);
-            if (w.active && w.deferred) jw::dropSide(isPlayer1);   // the older held-back tap never reached the engine
-            else                        jw::flushSide(self, isPlayer1);   // a stale queued release goes first
-            jw::beginCushion(w, p);
+            jw::flushSide(self, isPlayer1);       // a stale queued release goes first
+
+            w = jw::Side{};
+            w.active    = true;
+            w.clickSeq  = jw::g_stepSeq;
+            w.clickTime = jw::Clock::now();
+            w.maxSteps  = std::max(jw::kMinHoldSteps,
+                              static_cast<int>(std::lround(static_cast<double>(jw::g_windowMs) / jw::kStepMs)));
             st.anyActive = true;
-            if (airborne) {
-                w.deferred  = true;
-                w.predTicks = jw::predictLanding(jw::g_track[jw::sideIdx(isPlayer1)]);
-                return;                               // NOT passed to GJBaseGameLayer::handleButton
+
+            if (jw::hasContact(p)) {
+                // Ground or orb contact right now: nothing to wait for.
+                jw::snapshotForPress(w, p);
+                w.pressed = true;
+                jw::logDecision("CUSHIONED: contact now, press forwarded and streamed until acknowledged", p);
+                GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                return;
             }
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            if (coyote) jw::finishCoyote(p, isPlayer1);
+
+            // Too early: hold the click back; runBuffer injects it on the first contact tick.
+            w.early = true;
+            jw::logDecision("HELD: nothing to land on yet, click buffered until the first contact tick", p);
             return;
         }
 
-        // Release while a press is being streamed: hold it in the tick queue,
-        // gated until the engine acknowledges (or the step budget ends).
+        // Release while a click is active (waiting or streaming): keep it in the queue, gated.
         if (w.active && !w.releaseQueued) {
             w.releaseQueued = true;
             jw::enqueue(false, isPlayer1, jw::g_stepSeq, true);
             return;
         }
 
-        // Any other release is queued too (due this tick), so ordering is
-        // always decided in one place.
         jw::enqueue(false, isPlayer1, jw::g_stepSeq, false);
         if (jw::g_inTick) jw::pump(self);
     }
 
     // Runs once per physics step. Original first (it feeds queued clicks through
-    // handleButton above), then supervise the stream and deliver due inputs.
+    // handleButton above), then track the wave, supervise buffered clicks and
+    // deliver due inputs.
     void processQueuedButtons(float dt, bool clearInputQueue) {
         GJBaseGameLayer* self = this;
         const bool inPlay = typeinfo_cast<PlayLayer*>(self) != nullptr;  // PlayLayer only, not the editor
@@ -836,7 +877,6 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         }
 
         ++jw::g_stepSeq;
-        jw::trackAir(self);                  // motion state for this tick, before any input is processed
         jw::g_inTick = true;
         GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
         jw::g_inTick = false;
@@ -846,15 +886,14 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             log::info("JW: physics-step hook is running");
         }
 
-        // Assist switched off (or level gone): never strand a queued input.
         if (!jw::assistActive()) {
-            jw::sendHeldBack(self);
             jw::flushAll(self);
             jw::resetSides();
             return;
         }
 
         const auto t0 = jw::Clock::now();
+        jw::trackWave(self);
         jw::runBuffer(self);
         jw::pump(self);
         jw::g_modUs += jw::msBetween(t0, jw::Clock::now()) * 1000.0;
@@ -874,6 +913,10 @@ class $modify(JWPlayLayer, PlayLayer) {
         label->setPosition({8.f, size.height - 8.f});
         label->setVisible(false);
         this->addChild(label, 100);
+
+        // One-time geometry cache for the wave predictor (done here so any
+        // cost lands in the loading screen, never in gameplay).
+        jw::buildWorldFrom(static_cast<GJBaseGameLayer*>(this));
     }
 
     void resetLevel() {
@@ -884,6 +927,8 @@ class $modify(JWPlayLayer, PlayLayer) {
 
     void onQuit() {
         jw::reset();
+        jw::g_world.clear();
+        jw::g_worldReady = false;
         PlayLayer::onQuit();
     }
 };

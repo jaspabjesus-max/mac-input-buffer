@@ -114,21 +114,32 @@ namespace jwmath {
         return false;
     }
 
-    // Should a direction change be held back this tick?
-    // Yes only if: turning now is fatal, but continuing for k ticks and then
-    // turning (some k <= maxHold) survives. Otherwise waiting cannot help.
-    inline bool shouldHoldFlip(const World& w, const WaveState& s, int curDir, int newDir,
-                               int maxHold, int horizon, std::vector<Box>& scratch) {
-        if (curDir == newDir) return false;
+    // What to do with a direction change this tick.
+    enum class FlipVerdict {
+        SameDir,      // not a direction change
+        NoObstacles,  // nothing nearby to judge against
+        TurnSafe,     // turning now survives the look-ahead
+        Hold,         // turning now crashes, but waiting <= maxHold ticks survives: buffer it
+        Doomed        // turning now crashes and waiting cannot help: deliver, do not eat the input
+    };
+
+    inline FlipVerdict judgeFlip(const World& w, const WaveState& s, int curDir, int newDir,
+                                 int maxHold, int horizon, std::vector<Box>& scratch) {
+        if (curDir == newDir) return FlipVerdict::SameDir;
         const double reachX = (horizon + maxHold) * s.vx + s.half;
         const double reachY = (horizon + maxHold) * s.vy + s.half;
         w.gather(s.x - s.half, s.x + reachX, s.y - reachY, s.y + reachY, scratch);
-        if (scratch.empty()) return false;
-        if (!pathFatal(scratch, s, newDir, newDir, 0, horizon)) return false;
+        if (scratch.empty()) return FlipVerdict::NoObstacles;
+        if (!pathFatal(scratch, s, newDir, newDir, 0, horizon)) return FlipVerdict::TurnSafe;
         for (int k = 1; k <= maxHold; ++k) {
-            if (!pathFatal(scratch, s, curDir, newDir, k, horizon)) return true;
+            if (!pathFatal(scratch, s, curDir, newDir, k, horizon)) return FlipVerdict::Hold;
         }
-        return false;
+        return FlipVerdict::Doomed;
+    }
+
+    inline bool shouldHoldFlip(const World& w, const WaveState& s, int curDir, int newDir,
+                               int maxHold, int horizon, std::vector<Box>& scratch) {
+        return judgeFlip(w, s, curDir, newDir, maxHold, horizon, scratch) == FlipVerdict::Hold;
     }
 }
 // END PURE
@@ -153,7 +164,8 @@ namespace jw {
 
     // ---- Wave predictor tuning -------------------------------------------
     constexpr bool   kWavePredict       = true;  // master switch for the look-ahead
-    constexpr int    kWaveMaxHoldSteps  = 6;     // a flip is never held longer than this (6 steps = 25 ms)
+    constexpr int    kWaveMinHoldSteps  = 6;     // a flip is never held longer than window-ms/4 steps, clamped to [6, 15] (25-62 ms)
+    constexpr int    kWaveMaxHoldCap    = 15;
     constexpr int    kWaveHorizon       = 24;    // steps simulated ahead (~100 ms: assumes you hold the new direction that long)
     constexpr double kWaveHalf          = 5.0;   // half the wave hitbox, in level units (scaled by the player's scale)
     constexpr double kHazardShrink      = 0.6;   // hazard bounding boxes are bigger than their real hitbox
@@ -217,13 +229,15 @@ namespace jw {
     inline bool g_enabled      = true;
     inline bool g_practiceOnly = false;
     inline int  g_windowMs     = 80;
-    inline int  g_waveDelay    = 0;
+    inline int  g_waveDelay    = 0;       // IGNORED: it was a pure input delay (kept only so the setting still loads)
     inline bool g_waveGuard    = false;
     inline bool g_stepHookSeen = false;
     inline bool g_inTick       = false;
     inline bool g_waveDown[2]  = {false, false};
     inline int  g_guardLogs    = 0;
-    inline double g_stepsPerFrame = 4.0;
+    inline uint64_t g_lastClickStep[2] = {0, 0};
+    inline uint64_t g_lastWaveStep[2]  = {0, 0};
+    inline int g_waveEval = 0, g_waveSafe = 0, g_waveHeld = 0, g_waveDoomed = 0, g_waveSkipped = 0, g_waveTimeout = 0;
     inline double g_modUs      = 0.0;
 
     inline std::vector<Event> g_queue;
@@ -447,10 +461,11 @@ namespace jw {
         g_queue.push_back(Event{dueStep, g_stepSeq, ++g_seq, down, p1, cushion, waveGate});
     }
 
-    inline uint64_t waveDelaySteps() {
-        if (g_waveDelay <= 0) return 0;
-        const long steps = std::lround(static_cast<double>(g_waveDelay) * g_stepsPerFrame);
-        return static_cast<uint64_t>(std::max<long>(steps, g_waveDelay));
+    // Wave inputs are never delayed. (wave-delay used to add a flat delay to every
+    // input; the wave now only ever holds a turn when it would crash.)
+    inline int waveMaxHold() {
+        const int fromWindow = static_cast<int>(std::lround(static_cast<double>(g_windowMs) / kStepMs / 4.0));
+        return std::clamp(fromWindow, kWaveMinHoldSteps, kWaveMaxHoldCap);
     }
 
     // ---------------------------------------------------------------------
@@ -515,13 +530,14 @@ namespace jw {
 
     inline bool waveMayDeliver(GJBaseGameLayer* layer, const Event& ev) {
         if (!kWavePredict || !g_worldReady) return true;
-        if (g_stepSeq - ev.bornStep >= static_cast<uint64_t>(kWaveMaxHoldSteps)) return true; // never eat an input
+        const int maxHold = waveMaxHold();
+        if (g_stepSeq - ev.bornStep >= static_cast<uint64_t>(maxHold)) { ++g_waveTimeout; return true; } // never eat an input
 
         const int i = sideIdx(ev.p1);
         PlayerObject* p = ev.p1 ? layer->m_player1 : layer->m_player2;
         const auto& t = g_wave[i];
-        if (!p || !p->m_isDart || !t.valid) return true;
-        if (p->m_isUpsideDown) return true; // direction mapping unverified when flipped: stay out of the way
+        if (!p || !p->m_isDart || !t.valid) { ++g_waveSkipped; return true; }
+        if (p->m_isUpsideDown)               { ++g_waveSkipped; return true; } // mapping unverified when flipped
 
         const double scale = std::clamp(static_cast<double>(p->getScale()), 0.3, 1.5);
         jwmath::WaveState s;
@@ -529,11 +545,31 @@ namespace jw {
         s.vx = t.vx;   s.vy = t.vx * t.slope;
         s.half = kWaveHalf * scale;
 
-        const int curDir = t.dir;
         const int newDir = waveDirFor(ev.down, p->m_isUpsideDown);
-        const bool hold = jwmath::shouldHoldFlip(g_world, s, curDir, newDir,
-                                                 kWaveMaxHoldSteps, kWaveHorizon, g_scratch);
-        return !hold;
+        const auto v = jwmath::judgeFlip(g_world, s, t.dir, newDir, maxHold, kWaveHorizon, g_scratch);
+
+        // Count each event once (the first time it is judged).
+        const bool firstLook = (g_stepSeq == ev.bornStep);
+        if (firstLook) {
+            ++g_waveEval;
+            if (v == jwmath::FlipVerdict::Hold)   ++g_waveHeld;
+            else if (v == jwmath::FlipVerdict::Doomed) ++g_waveDoomed;
+            else ++g_waveSafe;
+            if (g_waveEval % 25 == 0) {
+                log::info("JW: wave predictor after {} turns: delivered at once={} held for a safe tick={} doomed(delivered)={} skipped={} hold-timeouts={}",
+                    g_waveEval, g_waveSafe, g_waveHeld, g_waveDoomed, g_waveSkipped, g_waveTimeout);
+            }
+        }
+        if (v == jwmath::FlipVerdict::Hold) {
+            static int holdLogs = 0;
+            if (firstLook && holdLogs < 200) {
+                ++holdLogs;
+                log::info("JW: wave {} HELD at x={:.1f} y={:.1f} dir={} (turning now would crash; max hold {} ticks)",
+                    ev.down ? "press" : "release", t.lastX, t.lastY, t.dir, maxHold);
+            }
+            return false;
+        }
+        return true;
     }
 
     inline void drain(GJBaseGameLayer* layer, bool force, int onlySide = -1) {
@@ -705,9 +741,6 @@ namespace jw {
 
         const uint64_t steps = g_stepSeq - lastSeq;
         lastSeq = g_stepSeq;
-        if (steps > 0 && steps <= 64) {
-            g_stepsPerFrame = std::clamp(g_stepsPerFrame * 0.9 + static_cast<double>(steps) * 0.1, 1.0, 16.0);
-        }
 
         auto* pl = PlayLayer::get();
         if (!pl) {
@@ -728,7 +761,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 14 loaded (contact-tick cube buffer, predictive wave turn buffer, tick-locked queue, macOS)");
+    log::info("JW: build 15 loaded (zero-delay wave with crash-only hold, no dropped early clicks, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -736,6 +769,10 @@ $on_mod(Loaded) {
     jw::g_waveGuard    = Mod::get()->getSettingValue<bool>("wave-guard");
     log::info("JW: loaded settings enabled={} practiceOnly={} windowMs={} waveDelay={}",
         jw::g_enabled, jw::g_practiceOnly, jw::g_windowMs, jw::g_waveDelay);
+    if (jw::g_waveDelay > 0) {
+        log::info("JW: NOTE wave-delay={} is ignored. It was a flat input delay; wave inputs now go through with zero delay and are only held when a turn would crash.",
+            jw::g_waveDelay);
+    }
 
     listenForSettingChanges<bool>("assist-enabled",   [](bool v)    { jw::g_enabled = v; });
     listenForSettingChanges<bool>("practice-only",    [](bool v)    { jw::g_practiceOnly = v; });
@@ -787,10 +824,11 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
         PlayerObject* p = isPlayer1 ? m_player1 : m_player2;
         auto& w = st.sides[isPlayer1 ? 0 : 1];
         const int side = isPlayer1 ? 0 : 1;
+        if (down) jw::g_lastClickStep[side] = jw::g_stepSeq;
 
         // ---- Wave: every direction change rides the tick queue and is gated
         // by the predictor (delivered at once when safe, held up to
-        // kWaveMaxHoldSteps ticks when turning right now would crash).
+        // waveMaxHold() ticks when turning right now would crash).
         if (p && p->m_isDart) {
             if (jw::g_waveGuard) {
                 if (down && jw::g_waveDown[side]) {
@@ -807,13 +845,14 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
             static int waveLogs = 0;
             if (waveLogs < 300) {
                 ++waveLogs;
-                log::info("JW: wave {} at step {} x={:.1f} y={:.1f} yVel={:.2f} (earliest delivery step {})",
+                log::info("JW: wave {} at step {} x={:.1f} y={:.1f} yVel={:.2f}",
                     down ? "press" : "release", jw::g_stepSeq,
                     static_cast<double>(p->getPositionX()), static_cast<double>(p->getPositionY()),
-                    static_cast<double>(p->m_yVelocity), jw::g_stepSeq + jw::waveDelaySteps());
+                    static_cast<double>(p->m_yVelocity));
             }
 
-            jw::enqueue(down, isPlayer1, jw::g_stepSeq + jw::waveDelaySteps(), false, true);
+            jw::g_lastWaveStep[side] = jw::g_stepSeq;
+            jw::enqueue(down, isPlayer1, jw::g_stepSeq, false, true);   // due now: no delay, only the predictor can hold it
             if (jw::g_inTick) jw::pump(self);
             return;
         }
@@ -825,6 +864,27 @@ class $modify(JWGameLayer, GJBaseGameLayer) {
                 jw::flushSide(self, isPlayer1);
                 w = jw::Side{};
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                return;
+            }
+
+            // A new click while an earlier one is still waiting for contact: keep the
+            // earlier buffered click (it is older, so it fires first) and just record
+            // that the player is holding again. Nothing the player clicked is dropped.
+            if (w.active && !w.pressed) {
+                if (w.releaseQueued) {
+                    auto& q = jw::g_queue;
+                    q.erase(std::remove_if(q.begin(), q.end(), [&](const jw::Event& e) {
+                        return e.p1 == isPlayer1 && !e.down && e.cushion;
+                    }), q.end());
+                    jw::refreshLastDue();
+                    w.releaseQueued = false;
+                }
+                static int mergeLogs = 0;
+                if (mergeLogs < 100) {
+                    ++mergeLogs;
+                    log::info("JW: second click while the first is still buffered: first click kept, waited {} steps so far",
+                        static_cast<int>(jw::g_stepSeq - w.clickSeq));
+                }
                 return;
             }
 
@@ -920,6 +980,20 @@ class $modify(JWPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        // Context for "what was going on when I died / restarted" (bounded).
+        static int ctxLogs = 0;
+        if (ctxLogs < 150 && jw::g_stepHookSeen) {
+            ++ctxLogs;
+            PlayerObject* p = m_player1;
+            const auto& w = jw::state().sides[0];
+            if (p) {
+                log::info("JW: level reset context: x={:.1f} y={:.1f} mode[ship={} ufo={} wave={} swing={} ball={} robot={} spider={}] steps since last click={} since last wave turn={} | buffered click: active={} pressed={} | queued inputs={}",
+                    static_cast<double>(p->getPositionX()), static_cast<double>(p->getPositionY()),
+                    p->m_isShip, p->m_isBird, p->m_isDart, p->m_isSwing, p->m_isBall, p->m_isRobot, p->m_isSpider,
+                    jw::g_stepSeq - jw::g_lastClickStep[0], jw::g_stepSeq - jw::g_lastWaveStep[0],
+                    w.active, w.pressed, jw::g_queue.size());
+            }
+        }
         jw::flushAll(static_cast<GJBaseGameLayer*>(this)); // never leave our own held press behind
         jw::reset();
         PlayLayer::resetLevel();

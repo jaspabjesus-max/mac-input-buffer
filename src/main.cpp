@@ -7,6 +7,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -148,7 +149,6 @@ namespace jw {
     // Diagnostics only. No gameplay decision reads the wall clock.
     using Clock = std::chrono::steady_clock;
 
-    constexpr int    kButtonJump = 1;
     constexpr double kJumpVel    = 5.0;      // old absolute test, kept for log comparison only
     constexpr double kRegisterDeltaV = 2.0;  // per-step velocity change that counts as an orb effect (with orb contact)
 
@@ -446,11 +446,18 @@ namespace jw {
     // The physics-tick input queue
     // ---------------------------------------------------------------------
 
+    // Send one virtual jump input to a player, bypassing our own intercept.
+    // (GJBaseGameLayer::handleButton has no address in the 2.2091 bindings, so
+    // inputs are applied through PlayerObject::pushButton / releaseButton,
+    // which is exactly what handleButton itself calls.)
     inline void inject(GJBaseGameLayer* layer, bool down, bool p1) {
+        PlayerObject* p = p1 ? layer->m_player1 : layer->m_player2;
+        if (!p) return;
         auto& st = state();
         const bool was = st.injecting;
         st.injecting = true;
-        layer->handleButton(down, kButtonJump, p1);
+        if (down) p->pushButton(PlayerButton::Jump);
+        else      p->releaseButton(PlayerButton::Jump);
         st.injecting = was;
     }
 
@@ -730,6 +737,141 @@ namespace jw {
         st.anyActive = st.sides[0].active || st.sides[1].active;
     }
 
+    // ---------------------------------------------------------------------
+    // Input intercept (called from the PlayerObject::pushButton / releaseButton hooks)
+    // ---------------------------------------------------------------------
+    // Returns true if the original call should go ahead now, false if the
+    // input was taken over (buffered / queued).
+    inline bool routeInput(PlayerObject* p, PlayerButton button, bool down) {
+        auto& st = state();
+        if (st.injecting || button != PlayerButton::Jump) return true; // our own injection, or platformer left/right
+
+        auto* pl = PlayLayer::get();
+        if (!pl || !p) return true;
+        GJBaseGameLayer* self = pl;
+        const bool isPlayer1 = (p == pl->m_player1);
+        if (!isPlayer1 && p != pl->m_player2) return true;             // not one of the level's players
+
+        static int diagLogs = 0;
+        if (down && diagLogs < 40) {
+            ++diagLogs;
+            log::info("JW: diag click age at game: mouse {:.1f} ms, key {:.1f} ms",
+                clickAgeMs(true), clickAgeMs(false));
+        }
+
+        if (!assistActive()) {
+            if (down) {
+                logDecision(g_enabled ? "PASS: assist inactive (practice-only outside practice, or no level)"
+                                      : "PASS: assist inactive (Enabled is off)", p);
+            }
+            flushSide(self, isPlayer1);   // anything still queued for this side goes out first
+            return true;
+        }
+
+        static bool logged = false;
+        if (!logged) { logged = true; log::info("JW: input intercept running (PlayerObject::pushButton / releaseButton)"); }
+
+        auto& w = st.sides[isPlayer1 ? 0 : 1];
+        const int side = isPlayer1 ? 0 : 1;
+        if (down) g_lastClickStep[side] = g_stepSeq;
+
+        // ---- Wave: every direction change rides the tick queue and is gated
+        // by the predictor (delivered at once when safe, held up to
+        // waveMaxHold() ticks when turning right now would crash).
+        if (p->m_isDart) {
+            if (g_waveGuard) {
+                if (down && g_waveDown[side]) {
+                    if (g_guardLogs < 20) {
+                        ++g_guardLogs;
+                        log::info("JW: dropped duplicate wave press");
+                    }
+                    return false;
+                }
+                g_waveDown[side] = down;
+            }
+            if (w.active) w = Side{};
+
+            static int waveLogs = 0;
+            if (waveLogs < 300) {
+                ++waveLogs;
+                log::info("JW: wave {} at step {} x={:.1f} y={:.1f} yVel={:.2f}",
+                    down ? "press" : "release", g_stepSeq,
+                    static_cast<double>(p->getPositionX()), static_cast<double>(p->getPositionY()),
+                    static_cast<double>(p->m_yVelocity));
+            }
+
+            g_lastWaveStep[side] = g_stepSeq;
+            enqueue(down, isPlayer1, g_stepSeq, false, true);   // due now: no delay, only the predictor can hold it
+            if (g_inTick) pump(self);
+            return false;
+        }
+        g_waveDown[side] = false;
+
+        if (down) {
+            if (g_windowMs <= 0 || !isCubeLike(p)) {
+                logDecision("PASS: window is 0 or mode not supported", p);
+                flushSide(self, isPlayer1);
+                w = Side{};
+                return true;
+            }
+
+            // A new click while an earlier one is still waiting for contact: keep the
+            // earlier buffered click (it is older, so it fires first) and just record
+            // that the player is holding again. Nothing the player clicked is dropped.
+            if (w.active && !w.pressed) {
+                if (w.releaseQueued) {
+                    g_queue.erase(std::remove_if(g_queue.begin(), g_queue.end(), [&](const Event& e) {
+                        return e.p1 == isPlayer1 && !e.down && e.cushion;
+                    }), g_queue.end());
+                    refreshLastDue();
+                    w.releaseQueued = false;
+                }
+                static int mergeLogs = 0;
+                if (mergeLogs < 100) {
+                    ++mergeLogs;
+                    log::info("JW: second click while the first is still buffered: first click kept, waited {} steps so far",
+                        static_cast<int>(g_stepSeq - w.clickSeq));
+                }
+                return false;
+            }
+
+            logReplaced(w);
+            flushSide(self, isPlayer1);       // a stale queued release goes first
+
+            w = Side{};
+            w.active    = true;
+            w.clickSeq  = g_stepSeq;
+            w.clickTime = Clock::now();
+            w.maxSteps  = std::max(kMinHoldSteps,
+                              static_cast<int>(std::lround(static_cast<double>(g_windowMs) / kStepMs)));
+            st.anyActive = true;
+
+            if (hasContact(p)) {
+                // Ground or orb contact right now: nothing to wait for.
+                snapshotForPress(w, p);
+                w.pressed = true;
+                logDecision("CUSHIONED: contact now, press forwarded and streamed until acknowledged", p);
+                return true;
+            }
+
+            // Too early: hold the click back; runBuffer injects it on the first contact tick.
+            w.early = true;
+            logDecision("HELD: nothing to land on yet, click buffered until the first contact tick", p);
+            return false;
+        }
+
+        // Release while a click is active (waiting or streaming): keep it in the queue, gated.
+        if (w.active && !w.releaseQueued) {
+            w.releaseQueued = true;
+            enqueue(false, isPlayer1, g_stepSeq, true);
+            return false;
+        }
+
+        enqueue(false, isPlayer1, g_stepSeq, false);
+        if (g_inTick) pump(self);
+        return false;
+    }
+
     // Runs once per rendered frame. Diagnostics and UI only.
     inline void tick() {
         const auto tickStart = Clock::now();
@@ -745,6 +887,8 @@ namespace jw {
         auto* pl = PlayLayer::get();
         if (!pl) {
             reset();
+            g_world.clear();     // left the level (this replaces the PlayLayer::onQuit hook, which has no address in these bindings)
+            g_worldReady = false;
             return;
         }
 
@@ -761,7 +905,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 15 loaded (zero-delay wave with crash-only hold, no dropped early clicks, macOS)");
+    log::info("JW: build 16 loaded (player-level input hooks for GD 2.2091, zero-delay wave, no dropped early clicks, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -791,142 +935,23 @@ class $modify(JWScheduler, CCScheduler) {
     }
 };
 
-class $modify(JWGameLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        auto& st = jw::state();
-
-        static int diagLogs = 0;
-        if (down && !st.injecting && button == jw::kButtonJump && diagLogs < 40) {
-            ++diagLogs;
-            log::info("JW: diag click age at game: mouse {:.1f} ms, key {:.1f} ms",
-                jw::clickAgeMs(true), jw::clickAgeMs(false));
-        }
-
-        GJBaseGameLayer* self = this;
-
-        if (st.injecting || button != jw::kButtonJump || !jw::assistActive()) {
-            if (!st.injecting && button == jw::kButtonJump) {
-                if (down) {
-                    jw::logDecision(
-                        jw::g_enabled ? "PASS: assist inactive (practice-only outside practice, or no level)"
-                                      : "PASS: assist inactive (Enabled is off)",
-                        isPlayer1 ? m_player1 : m_player2);
-                }
-                jw::flushSide(self, isPlayer1);
-            }
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        static bool logged = false;
-        if (!logged) { logged = true; log::info("JW: handleButton intercept running"); }
-
-        PlayerObject* p = isPlayer1 ? m_player1 : m_player2;
-        auto& w = st.sides[isPlayer1 ? 0 : 1];
-        const int side = isPlayer1 ? 0 : 1;
-        if (down) jw::g_lastClickStep[side] = jw::g_stepSeq;
-
-        // ---- Wave: every direction change rides the tick queue and is gated
-        // by the predictor (delivered at once when safe, held up to
-        // waveMaxHold() ticks when turning right now would crash).
-        if (p && p->m_isDart) {
-            if (jw::g_waveGuard) {
-                if (down && jw::g_waveDown[side]) {
-                    if (jw::g_guardLogs < 20) {
-                        ++jw::g_guardLogs;
-                        log::info("JW: dropped duplicate wave press");
-                    }
-                    return;
-                }
-                jw::g_waveDown[side] = down;
-            }
-            if (w.active) w = jw::Side{};
-
-            static int waveLogs = 0;
-            if (waveLogs < 300) {
-                ++waveLogs;
-                log::info("JW: wave {} at step {} x={:.1f} y={:.1f} yVel={:.2f}",
-                    down ? "press" : "release", jw::g_stepSeq,
-                    static_cast<double>(p->getPositionX()), static_cast<double>(p->getPositionY()),
-                    static_cast<double>(p->m_yVelocity));
-            }
-
-            jw::g_lastWaveStep[side] = jw::g_stepSeq;
-            jw::enqueue(down, isPlayer1, jw::g_stepSeq, false, true);   // due now: no delay, only the predictor can hold it
-            if (jw::g_inTick) jw::pump(self);
-            return;
-        }
-        jw::g_waveDown[side] = false;
-
-        if (down) {
-            if (jw::g_windowMs <= 0 || !jw::isCubeLike(p)) {
-                jw::logDecision("PASS: window is 0 or mode not supported", p);
-                jw::flushSide(self, isPlayer1);
-                w = jw::Side{};
-                GJBaseGameLayer::handleButton(down, button, isPlayer1);
-                return;
-            }
-
-            // A new click while an earlier one is still waiting for contact: keep the
-            // earlier buffered click (it is older, so it fires first) and just record
-            // that the player is holding again. Nothing the player clicked is dropped.
-            if (w.active && !w.pressed) {
-                if (w.releaseQueued) {
-                    auto& q = jw::g_queue;
-                    q.erase(std::remove_if(q.begin(), q.end(), [&](const jw::Event& e) {
-                        return e.p1 == isPlayer1 && !e.down && e.cushion;
-                    }), q.end());
-                    jw::refreshLastDue();
-                    w.releaseQueued = false;
-                }
-                static int mergeLogs = 0;
-                if (mergeLogs < 100) {
-                    ++mergeLogs;
-                    log::info("JW: second click while the first is still buffered: first click kept, waited {} steps so far",
-                        static_cast<int>(jw::g_stepSeq - w.clickSeq));
-                }
-                return;
-            }
-
-            jw::logReplaced(w);
-            jw::flushSide(self, isPlayer1);       // a stale queued release goes first
-
-            w = jw::Side{};
-            w.active    = true;
-            w.clickSeq  = jw::g_stepSeq;
-            w.clickTime = jw::Clock::now();
-            w.maxSteps  = std::max(jw::kMinHoldSteps,
-                              static_cast<int>(std::lround(static_cast<double>(jw::g_windowMs) / jw::kStepMs)));
-            st.anyActive = true;
-
-            if (jw::hasContact(p)) {
-                // Ground or orb contact right now: nothing to wait for.
-                jw::snapshotForPress(w, p);
-                w.pressed = true;
-                jw::logDecision("CUSHIONED: contact now, press forwarded and streamed until acknowledged", p);
-                GJBaseGameLayer::handleButton(down, button, isPlayer1);
-                return;
-            }
-
-            // Too early: hold the click back; runBuffer injects it on the first contact tick.
-            w.early = true;
-            jw::logDecision("HELD: nothing to land on yet, click buffered until the first contact tick", p);
-            return;
-        }
-
-        // Release while a click is active (waiting or streaming): keep it in the queue, gated.
-        if (w.active && !w.releaseQueued) {
-            w.releaseQueued = true;
-            jw::enqueue(false, isPlayer1, jw::g_stepSeq, true);
-            return;
-        }
-
-        jw::enqueue(false, isPlayer1, jw::g_stepSeq, false);
-        if (jw::g_inTick) jw::pump(self);
+class $modify(JWPlayer, PlayerObject) {
+    // Every click reaches the game through these two functions (GJBaseGameLayer::handleButton
+    // calls them), so this is where early clicks are caught.
+    bool pushButton(PlayerButton button) {
+        if (!jw::routeInput(this, button, true)) return false;
+        return PlayerObject::pushButton(button);
     }
 
+    bool releaseButton(PlayerButton button) {
+        if (!jw::routeInput(this, button, false)) return false;
+        return PlayerObject::releaseButton(button);
+    }
+};
+
+class $modify(JWGameLayer, GJBaseGameLayer) {
     // Runs once per physics step. Original first (it feeds queued clicks through
-    // handleButton above), then track the wave, supervise buffered clicks and
+    // the PlayerObject hooks above), then track the wave, supervise buffered clicks and
     // deliver due inputs.
     void processQueuedButtons(float dt, bool clearInputQueue) {
         GJBaseGameLayer* self = this;
@@ -997,12 +1022,5 @@ class $modify(JWPlayLayer, PlayLayer) {
         jw::flushAll(static_cast<GJBaseGameLayer*>(this)); // never leave our own held press behind
         jw::reset();
         PlayLayer::resetLevel();
-    }
-
-    void onQuit() {
-        jw::reset();
-        jw::g_world.clear();
-        jw::g_worldReady = false;
-        PlayLayer::onQuit();
     }
 };

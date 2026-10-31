@@ -7,7 +7,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -149,6 +148,7 @@ namespace jw {
     // Diagnostics only. No gameplay decision reads the wall clock.
     using Clock = std::chrono::steady_clock;
 
+    constexpr int    kButtonJump = 1;
     constexpr double kJumpVel    = 5.0;      // old absolute test, kept for log comparison only
     constexpr double kRegisterDeltaV = 2.0;  // per-step velocity change that counts as an orb effect (with orb contact)
 
@@ -446,18 +446,12 @@ namespace jw {
     // The physics-tick input queue
     // ---------------------------------------------------------------------
 
-    // Send one virtual jump input to a player, bypassing our own intercept.
-    // (GJBaseGameLayer::handleButton has no address in the 2.2091 bindings, so
-    // inputs are applied through PlayerObject::pushButton / releaseButton,
-    // which is exactly what handleButton itself calls.)
+    // Send one virtual jump input to the game, bypassing our own intercept.
     inline void inject(GJBaseGameLayer* layer, bool down, bool p1) {
-        PlayerObject* p = p1 ? layer->m_player1 : layer->m_player2;
-        if (!p) return;
         auto& st = state();
         const bool was = st.injecting;
         st.injecting = true;
-        if (down) p->pushButton(PlayerButton::Jump);
-        else      p->releaseButton(PlayerButton::Jump);
+        layer->handleButton(down, kButtonJump, p1);
         st.injecting = was;
     }
 
@@ -738,19 +732,18 @@ namespace jw {
     }
 
     // ---------------------------------------------------------------------
-    // Input intercept (called from the PlayerObject::pushButton / releaseButton hooks)
+    // Input intercept (called from the GJBaseGameLayer::handleButton hook)
     // ---------------------------------------------------------------------
-    // Returns true if the original call should go ahead now, false if the
-    // input was taken over (buffered / queued).
-    inline bool routeInput(PlayerObject* p, PlayerButton button, bool down) {
+    // Returns true if the original handleButton should go ahead now, false if
+    // the input was taken over (buffered / queued).
+    inline bool routeInput(bool down, int button, bool isPlayer1) {
         auto& st = state();
-        if (st.injecting || button != PlayerButton::Jump) return true; // our own injection, or platformer left/right
+        if (st.injecting || button != kButtonJump) return true;        // our own injection, or platformer left/right
 
         auto* pl = PlayLayer::get();
-        if (!pl || !p) return true;
+        if (!pl) return true;
         GJBaseGameLayer* self = pl;
-        const bool isPlayer1 = (p == pl->m_player1);
-        if (!isPlayer1 && p != pl->m_player2) return true;             // not one of the level's players
+        PlayerObject* p = isPlayer1 ? pl->m_player1 : pl->m_player2;
 
         static int diagLogs = 0;
         if (down && diagLogs < 40) {
@@ -769,7 +762,7 @@ namespace jw {
         }
 
         static bool logged = false;
-        if (!logged) { logged = true; log::info("JW: input intercept running (PlayerObject::pushButton / releaseButton)"); }
+        if (!logged) { logged = true; log::info("JW: handleButton intercept running"); }
 
         auto& w = st.sides[isPlayer1 ? 0 : 1];
         const int side = isPlayer1 ? 0 : 1;
@@ -887,7 +880,7 @@ namespace jw {
         auto* pl = PlayLayer::get();
         if (!pl) {
             reset();
-            g_world.clear();     // left the level (this replaces the PlayLayer::onQuit hook, which has no address in these bindings)
+            g_world.clear();     // left the level
             g_worldReady = false;
             return;
         }
@@ -905,7 +898,7 @@ namespace jw {
 }
 
 $on_mod(Loaded) {
-    log::info("JW: build 16 loaded (player-level input hooks for GD 2.2091, zero-delay wave, no dropped early clicks, macOS)");
+    log::info("JW: build 17 loaded (GD 2.2081 hooks, zero-delay wave, no dropped early clicks, macOS)");
     jw::g_enabled      = Mod::get()->getSettingValue<bool>("assist-enabled");
     jw::g_practiceOnly = Mod::get()->getSettingValue<bool>("practice-only");
     jw::g_windowMs     = static_cast<int>(Mod::get()->getSettingValue<int64_t>("window-ms"));
@@ -935,23 +928,16 @@ class $modify(JWScheduler, CCScheduler) {
     }
 };
 
-class $modify(JWPlayer, PlayerObject) {
-    // Every click reaches the game through these two functions (GJBaseGameLayer::handleButton
-    // calls them), so this is where early clicks are caught.
-    bool pushButton(PlayerButton button) {
-        if (!jw::routeInput(this, button, true)) return false;
-        return PlayerObject::pushButton(button);
-    }
-
-    bool releaseButton(PlayerButton button) {
-        if (!jw::routeInput(this, button, false)) return false;
-        return PlayerObject::releaseButton(button);
-    }
-};
-
 class $modify(JWGameLayer, GJBaseGameLayer) {
+    // Every click passes through here before the game applies it.
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (jw::routeInput(down, button, isPlayer1)) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        }
+    }
+
     // Runs once per physics step. Original first (it feeds queued clicks through
-    // the PlayerObject hooks above), then track the wave, supervise buffered clicks and
+    // handleButton above), then track the wave, supervise buffered clicks and
     // deliver due inputs.
     void processQueuedButtons(float dt, bool clearInputQueue) {
         GJBaseGameLayer* self = this;
@@ -1022,5 +1008,12 @@ class $modify(JWPlayLayer, PlayLayer) {
         jw::flushAll(static_cast<GJBaseGameLayer*>(this)); // never leave our own held press behind
         jw::reset();
         PlayLayer::resetLevel();
+    }
+
+    void onQuit() {
+        jw::reset();
+        jw::g_world.clear();
+        jw::g_worldReady = false;
+        PlayLayer::onQuit();
     }
 };
